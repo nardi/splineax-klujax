@@ -50,6 +50,7 @@ flowchart LR
 ## Constraints
 
 - **CPU only** — KLU is a CPU algorithm. No GPU support.
+- **x64 required** — enable JAX 64-bit mode yourself (`jax.config.update("jax_enable_x64", True)`); klujax raises if it is off.
 - **float64 / complex128 only** — lower precision inputs are automatically upcast.
 - Sparse matrices must be in **COO format** (coordinate format).
 - Duplicate indices must be **coalesced** before solving (use `klujax.coalesce`).

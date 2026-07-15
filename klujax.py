@@ -45,10 +45,28 @@ from jaxtyping import Array
 # Config ==============================================================================
 
 DEBUG = bool(int(os.environ.get("KLUJAX_DEBUG", "0")))
-jax.config.update(name="jax_enable_x64", val=True)
-jax.config.update(name="jax_platform_name", val="cpu")
 debug = lambda s: None if not DEBUG else print(s, file=sys.stderr)  # noqa: E731,T201
 debug("KLUJAX DEBUG MODE.")
+
+
+def _require_x64() -> None:
+    """Raise if JAX 64-bit mode is disabled.
+
+    klujax casts inputs to float64/complex128; without x64 these silently
+    truncate to 32-bit, giving wrong results. So we require x64 explicitly.
+    """
+    if not jax.config.jax_enable_x64:  # ty:ignore[unresolved-attribute]
+        msg = (
+            "klujax requires JAX 64-bit mode, but it is disabled. "
+            "Enable it globally:\n"
+            "    import jax\n"
+            "    jax.config.update('jax_enable_x64', True)\n"
+            "or scope it with the context manager:\n"
+            "    with jax.experimental.enable_x64():\n"
+            "        ...  # klujax calls here"
+        )
+        raise RuntimeError(msg)
+
 
 # Constants ===========================================================================
 
@@ -76,6 +94,7 @@ def solve(Ai: Array, Aj: Array, Ax: Array, b: Array) -> Array:
         x: the result (x≈A^-1b)
 
     """
+    _require_x64()
     debug("solve")
     Ai, Aj, Ax, b, shape = validate_args(Ai, Aj, Ax, b, x_name="b")
     if any(x.dtype in COMPLEX_DTYPES for x in (Ax, b)):
@@ -112,6 +131,7 @@ def dot(Ai: Array, Aj: Array, Ax: Array, x: Array) -> Array:
         b: the result (b=A@x)
 
     """
+    _require_x64()
     debug("dot")
     Ai, Aj, Ax, x, shape = validate_args(Ai, Aj, Ax, x, x_name="x")
     if any(x.dtype in COMPLEX_DTYPES for x in (Ax, x)):
@@ -327,6 +347,7 @@ def analyze(Ai: Array, Aj: Array, n_col: int) -> KLUHandleManager:
         symbolic: [KLUHandleManager]: the symbolic analysis object
 
     """
+    _require_x64()
     Ai = jnp.asarray(Ai, dtype=jnp.int32)
     Aj = jnp.asarray(Aj, dtype=jnp.int32)
     raw_symbol = analyze_p.bind(Ai, Aj, jnp.int32(n_col))
@@ -410,6 +431,7 @@ def solve_with_symbol(
         x: the result (x≈A^-1b)
 
     """
+    _require_x64()
     handle = getattr(symbolic, "handle", symbolic)
     return _solve_with_symbol_jit(Ai, Aj, Ax, b, handle)
 
@@ -457,6 +479,7 @@ def tsolve_with_symbol(
         x: the result (x≈(A^T)^-1 b)
 
     """
+    _require_x64()
     handle = getattr(symbolic, "handle", symbolic)
     return _tsolve_with_symbol_jit(Ai, Aj, Ax, b, handle)
 
@@ -484,6 +507,7 @@ def factor(
         numeric: [KLUHandleManager]: the numeric factorization object
 
     """
+    _require_x64()
     sym_h = getattr(symbolic, "handle", symbolic)
     raw_numeric = _factor_jit(Ai, Aj, Ax, sym_h)
     return KLUHandleManager(raw_numeric, free_numeric, owner=True)
@@ -527,6 +551,7 @@ def refactor(
             (same pointer, for XLA dep tracking)
 
     """
+    _require_x64()
     num_h = getattr(numeric, "handle", numeric)
     sym_h = getattr(symbolic, "handle", symbolic)
     raw_handle = _refactor_jit(Ai, Aj, Ax, sym_h, num_h)
@@ -557,6 +582,7 @@ def solve_with_numeric(
         x: the result (x≈A^-1b)
 
     """
+    _require_x64()
     num_h = getattr(numeric, "handle", numeric)
     sym_h = getattr(symbolic, "handle", symbolic)
     return _solve_with_numeric_jit(num_h, b, sym_h)
@@ -593,6 +619,7 @@ def tsolve_with_numeric(
         x: the result (x≈(A^T)^-1 b)
 
     """
+    _require_x64()
     num_h = getattr(numeric, "handle", numeric)
     sym_h = getattr(symbolic, "handle", symbolic)
     return _tsolve_with_numeric_jit(num_h, b, sym_h)
@@ -654,6 +681,7 @@ def refactor_and_solve(
                       (same pointer as input, owner=False, for XLA dep tracking)
 
     """
+    _require_x64()
     num_h = getattr(numeric, "handle", numeric)
     sym_h = getattr(symbolic, "handle", symbolic)
     x, raw_numeric = _refactor_and_solve_jit(Ai, Aj, Ax, b, sym_h, num_h)

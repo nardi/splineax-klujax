@@ -154,4 +154,4 @@ klujax only supports double precision:
 If either `Ax` or `b` is complex, the entire solve uses complex arithmetic.
 
 !!! note
-    klujax automatically enables `jax_enable_x64` when imported. You don't need to configure this yourself.
+    klujax requires JAX 64-bit mode. Enable it yourself before calling klujax, either globally with `jax.config.update("jax_enable_x64", True)` or scoped with the `jax.experimental.enable_x64()` context manager. klujax raises a `RuntimeError` if x64 is disabled.
