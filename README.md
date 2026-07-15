@@ -1,8 +1,15 @@
 # KLUJAX
 
-> version: 0.5.0
+> version: 0.5.0.post1
 
 A sparse linear solver for JAX based on the efficient [KLU algorithm](https://ufdcimages.uflib.ufl.edu/UF/E0/01/17/21/00001/palamadai_e.pdf).
+
+> This is a fork of the original
+> [`klujax`](https://github.com/gdsfactory/klujax) package, meant for use in
+> [`splineax`](https://github.com/nardi/splineax). The aim is to eventually
+> merge the changes here into the upstream package and remove this fork. In the
+> meantime, the version number will stay as 0.5.0.postN, and N will be
+> incremented sequentially on each new published version.
 
 ## CPU & float64
 
@@ -181,7 +188,7 @@ The library is statically linked to the SuiteSparse C++ library. It can be insta
 most platforms as follows:
 
 ```bash
-pip install klujax
+pip install splineax-klujax
 ```
 
 **There exist pre-built wheels for Linux and Windows (python 3.8+).** If no compatible

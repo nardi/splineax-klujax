@@ -146,7 +146,7 @@ jobs:
               marker = f"{pm} and {plat}" if pm else plat
               entries.append((whl.name, marker))
 
-          lines = ["[tool.uv.sources]", "klujax = ["]
+          lines = ["[tool.uv.sources]", "splineax-klujax = ["]
           lines += [f'    {{ url = "{base}/{n}", marker = "{mk}" }},' for n, mk in entries]
           lines.append("]")
           toml = "\n".join(lines) + "\n"

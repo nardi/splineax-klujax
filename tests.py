@@ -12,7 +12,7 @@ from jax import lax
 import klujax
 from klujax import COMPLEX_DTYPES, coalesce
 
-jax.config.update("jax_enable_x64", True)
+jax.config.update("jax_enable_x64", val=True)
 
 OPS_DENSE = {  # sparse to dense
     klujax.dot: lax.dot,

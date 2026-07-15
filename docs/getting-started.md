@@ -10,7 +10,7 @@ summary: Install klujax and solve your first sparse system
 /// tab | uv
 
 ```bash
-uv add klujax
+uv add splineax-klujax
 ```
 
 ///
@@ -18,7 +18,7 @@ uv add klujax
 /// tab | pip
 
 ```bash
-pip install klujax
+pip install splineax-klujax
 ```
 
 ///
