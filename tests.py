@@ -362,6 +362,29 @@ def _get_rand_arrs_3d(n_lhs, n_nz, n_col, n_rhs, *, dtype, seed=33):
     return Ai, Aj, Ax, b
 
 
+def _get_singular_arrs_1d(n_col, *, dtype, seed=33):
+    """A diagonal matrix (10.0 on the diagonal) with the first diagonal entry
+    zeroed out, making it exactly singular."""
+    bkey = jax.random.PRNGKey(seed)
+    diag_i = jnp.arange(n_col, dtype=jnp.int32)
+    diag_x = (jnp.ones(n_col, dtype=dtype) * 10.0).at[0].set(0.0)
+    Ai, Aj, Ax = coalesce(diag_i, diag_i, diag_x)
+    b = jax.random.normal(bkey, (n_col,), dtype=dtype)
+    return Ai, Aj, Ax, b
+
+
+def _get_partially_singular_arrs_2d(n_lhs, n_col, *, dtype, singular_lhs, seed=33):
+    """A batched diagonal matrix (10.0 on the diagonal) where only
+    `singular_lhs`'s first diagonal entry is zeroed out, so exactly that one
+    batch element is singular while the others stay well-posed."""
+    bkey = jax.random.PRNGKey(seed)
+    diag_i = jnp.arange(n_col, dtype=jnp.int32)
+    diag_x = (jnp.ones((n_lhs, n_col), dtype=dtype) * 10.0).at[singular_lhs, 0].set(0.0)
+    Ai, Aj, Ax = coalesce(diag_i, diag_i, diag_x)
+    b = jax.random.normal(bkey, (n_lhs, n_col), dtype=dtype)
+    return Ai, Aj, Ax, b
+
+
 def _log_and_test_equality(x, x_sp):
     print(f"\nx=\n{x}")
     print(f"\nx_sp=\n{x_sp}")
@@ -677,6 +700,92 @@ def test_refactor_and_solve_batched(dtype):
 
     klujax.free_numeric(num)
     klujax.free_symbolic(sym)
+
+
+# Singular-matrix handling: `solve`, `solve_with_symbol`, `tsolve_with_symbol`, and
+# `refactor_and_solve` must return NaN for a singular system instead of raising, matching
+# how LAPACK-backed solvers behave. `solve_with_numeric`/`tsolve_with_numeric` are not
+# covered here: they operate on an already-factored numeric handle, and `factor`/`analyze`
+# (which would themselves fail first on a singular matrix) are unchanged, so there's no way
+# to reach those two with a singular matrix through the public API.
+
+
+@log_test_name
+@parametrize_dtypes
+def test_solve_singular(dtype):
+    Ai, Aj, Ax, b = _get_singular_arrs_1d((n_col := 5), dtype=dtype)
+    x_sp = klujax.solve(Ai, Aj, Ax, b)
+    assert x_sp.shape == (n_col,)
+    assert jnp.all(jnp.isnan(x_sp))
+
+
+@log_test_name
+@parametrize_dtypes
+def test_solve_with_symbol_singular(dtype):
+    Ai, Aj, Ax, b = _get_singular_arrs_1d((n_col := 5), dtype=dtype)
+    symbolic = klujax.analyze(Ai, Aj, n_col)
+
+    x_sp = klujax.solve_with_symbol(Ai, Aj, Ax, b, symbolic)
+    assert jnp.all(jnp.isnan(x_sp))
+
+    klujax.free_symbolic(symbolic)
+
+
+@log_test_name
+@parametrize_dtypes
+def test_tsolve_with_symbol_singular(dtype):
+    Ai, Aj, Ax, b = _get_singular_arrs_1d((n_col := 5), dtype=dtype)
+    symbolic = klujax.analyze(Ai, Aj, n_col)
+
+    x_sp = klujax.tsolve_with_symbol(Ai, Aj, Ax, b, symbolic)
+    assert jnp.all(jnp.isnan(x_sp))
+
+    klujax.free_symbolic(symbolic)
+
+
+@log_test_name
+@parametrize_dtypes
+def test_refactor_and_solve_singular(dtype):
+    # `factor` runs on a well-posed matrix (refactor_and_solve needs an existing, valid
+    # numeric handle to refactor); the *new* Ax values passed to refactor_and_solve are
+    # what's singular.
+    Ai, Aj, Ax, b = _get_rand_arrs_1d(15, (n_col := 5), dtype=dtype)
+    sym = klujax.analyze(Ai, Aj, n_col)
+    num = klujax.factor(Ai, Aj, Ax, sym)
+
+    # Zero out every entry in row 0, guaranteeing an all-zero row (singular) regardless
+    # of the rest of the (otherwise random) matrix.
+    row0_mask = Ai == 0
+    Ax2 = jnp.where(row0_mask, jnp.zeros_like(Ax), Ax)
+
+    x_sp, _num2 = klujax.refactor_and_solve(Ai, Aj, Ax2, b, num, sym)
+    assert jnp.all(jnp.isnan(x_sp))
+
+    klujax.free_numeric(num)
+    klujax.free_symbolic(sym)
+
+
+@log_test_name
+@parametrize_dtypes
+def test_solve_batched_partially_singular(dtype):
+    """Only one batch element is singular: its slice must be NaN, but the other
+    (well-posed) batch elements must still solve correctly. This is the key behavior
+    change from the old code, which aborted the *entire* batch on one singular element."""
+    n_lhs, n_col = 3, 5
+    singular_lhs = 1
+    Ai, Aj, Ax, b = _get_partially_singular_arrs_2d(
+        n_lhs, n_col, dtype=dtype, singular_lhs=singular_lhs
+    )
+
+    x_sp = klujax.solve(Ai, Aj, Ax, b)
+    assert jnp.all(jnp.isnan(x_sp[singular_lhs]))
+
+    op_dense = jax.vmap(jsp.linalg.solve, (0, 0), 0)
+    A = jnp.zeros((n_lhs, n_col, n_col), dtype=dtype).at[:, Ai, Aj].add(Ax)
+    x = op_dense(A, b)
+    well_posed = jnp.array([i for i in range(n_lhs) if i != singular_lhs])
+    assert not jnp.any(jnp.isnan(x_sp[well_posed]))
+    _log_and_test_equality(x[well_posed], x_sp[well_posed])
 
 
 # KLUHandleManager testing

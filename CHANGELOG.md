@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.0.post2
+
+- `solve`, `solve_with_symbol`, `tsolve_with_symbol`, `solve_with_numeric`,
+  `tsolve_with_numeric`, and `refactor_and_solve` now return NaN for a
+  singular matrix instead of raising, matching standard LAPACK-style
+  behavior
+
 ## 0.4.0
 
 - Upgrade to jax>=0.5.0

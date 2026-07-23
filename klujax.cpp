@@ -1,10 +1,12 @@
 // version: 0.5.0
 // Imports
 
+#include <algorithm>
 #include <cmath>
 #include <complex>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <memory>
 
 #include "klu.h"
@@ -162,6 +164,23 @@ struct KluTraits<Complex> {
     }
 };
 
+// Fills a batch element's output slice with NaN, used when KLU fails to factor/solve
+// a singular matrix. This mirrors how LAPACK-backed solvers return NaN on singular
+// systems instead of raising, letting callers detect failure from the output values.
+template <typename T>
+void fill_nan(T* dst, int n);
+
+template <>
+void fill_nan<double>(double* dst, int n) {
+    std::fill(dst, dst + n, std::numeric_limits<double>::quiet_NaN());
+}
+
+template <>
+void fill_nan<Complex>(Complex* dst, int n) {
+    std::fill(dst, dst + n,
+              Complex(std::numeric_limits<double>::quiet_NaN(), std::numeric_limits<double>::quiet_NaN()));
+}
+
 template <typename T>
 ffi::Error dot_impl(
     const ffi::Buffer<ffi::DataType::S32>& Ai,
@@ -306,17 +325,22 @@ ffi::Error solve_impl(
             _Bx[k] = _Ax[m + _Bk[k]];
         }
 
-        // solve using KLU
+        // solve using KLU. A singular matrix (or otherwise failed factor/solve) fills this
+        // batch element's output with NaN instead of aborting the whole call, mirroring how
+        // LAPACK-backed solvers behave on a singular system.
         Numeric = KluTraits<T>::factor(_Bp.get(), _Bi.get(), _Bx.get(), Symbolic, &Common);
         if (Numeric == nullptr || Common.status < KLU_OK) {
-            klu_free_symbolic(&Symbolic, &Common);
-            return ffi::Error::InvalidArgument("klu_factor/z_factor failed (singular matrix?)");
+            if (Numeric != nullptr) {
+                klu_free_numeric(&Numeric, &Common);
+            }
+            fill_nan(&_x_temp[n], n_rhs * n_col);
+            continue;
         }
         KluTraits<T>::solve(Symbolic, Numeric, n_col, n_rhs, &_x_temp[n], &Common);
         if (Common.status < KLU_OK) {
             klu_free_numeric(&Numeric, &Common);
-            klu_free_symbolic(&Symbolic, &Common);
-            return ffi::Error::InvalidArgument("klu_solve/z_solve failed");
+            fill_nan(&_x_temp[n], n_rhs * n_col);
+            continue;
         }
         klu_free_numeric(&Numeric, &Common);
     }
@@ -437,15 +461,22 @@ ffi::Error solve_with_symbol_impl(
             _Bx[k] = _Ax[m + _Bk[k]];
         }
 
-        // solve using KLU with provided Symbolic handle
+        // solve using KLU with provided Symbolic handle. A singular matrix (or otherwise
+        // failed factor/solve) fills this batch element's output with NaN instead of
+        // aborting the whole call, mirroring how LAPACK-backed solvers behave.
         Numeric = KluTraits<T>::factor(_Bp.get(), _Bi.get(), _Bx.get(), Symbolic, &Common);
         if (Numeric == nullptr || Common.status < KLU_OK) {
-            return ffi::Error::InvalidArgument("klu_factor/z_factor failed (singular matrix?)");
+            if (Numeric != nullptr) {
+                klu_free_numeric(&Numeric, &Common);
+            }
+            fill_nan(&_x_temp[n], n_rhs * n_col);
+            continue;
         }
         KluTraits<T>::solve(Symbolic, Numeric, n_col, n_rhs, &_x_temp[n], &Common);
         if (Common.status < KLU_OK) {
             klu_free_numeric(&Numeric, &Common);
-            return ffi::Error::InvalidArgument("klu_solve/z_solve failed");
+            fill_nan(&_x_temp[n], n_rhs * n_col);
+            continue;
         }
         klu_free_numeric(&Numeric, &Common);
     }
@@ -565,15 +596,23 @@ ffi::Error tsolve_with_symbol_impl(
             _Bx[k] = _Ax[m + _Bk[k]];
         }
 
+        // A singular matrix (or otherwise failed factor/solve) fills this batch element's
+        // output with NaN instead of aborting the whole call, mirroring how LAPACK-backed
+        // solvers behave.
         Numeric = KluTraits<T>::factor(_Bp.get(), _Bi.get(), _Bx.get(), Symbolic, &Common);
         if (Numeric == nullptr || Common.status < KLU_OK) {
-            return ffi::Error::InvalidArgument("klu_factor/z_factor failed (singular matrix?)");
+            if (Numeric != nullptr) {
+                klu_free_numeric(&Numeric, &Common);
+            }
+            fill_nan(&_x_temp[n], n_rhs * n_col);
+            continue;
         }
         // NOTE: tsolve instead of solve
         KluTraits<T>::tsolve(Symbolic, Numeric, n_col, n_rhs, &_x_temp[n], &Common);
         if (Common.status < KLU_OK) {
             klu_free_numeric(&Numeric, &Common);
-            return ffi::Error::InvalidArgument("klu_tsolve/z_tsolve failed");
+            fill_nan(&_x_temp[n], n_rhs * n_col);
+            continue;
         }
         klu_free_numeric(&Numeric, &Common);
     }
@@ -907,16 +946,24 @@ ffi::Error refactor_and_solve_impl(
             _Bx[k] = _Ax[m + _Bk[k]];
         }
 
-        // Refactor in-place (reuses pivots from original factor call)
+        // Refactor in-place (reuses pivots from original factor call). A singular matrix (or
+        // otherwise failed refactor/solve) fills this batch element's output with NaN instead
+        // of aborting the whole call, mirroring how LAPACK-backed solvers behave. A failed
+        // klu_refactor does not invalidate `Numeric` for a future refactor attempt, so the
+        // handle is still passed through unchanged.
         int status = KluTraits<T>::refactor(_Bp.get(), _Bi.get(), _Bx.get(), Symbolic, Numeric, &Common);
         if (!status || Common.status < KLU_OK) {
-            return ffi::Error::InvalidArgument("klu_refactor/z_refactor failed (singular matrix?)");
+            fill_nan(&_x_temp[n], n_rhs * n_col);
+            _out_numeric[i] = num_addr;
+            continue;
         }
 
         // Solve immediately using the freshly refactored numeric
         KluTraits<T>::solve(Symbolic, Numeric, n_col, n_rhs, &_x_temp[n], &Common);
         if (Common.status < KLU_OK) {
-            return ffi::Error::InvalidArgument("klu_solve/z_solve failed");
+            fill_nan(&_x_temp[n], n_rhs * n_col);
+            _out_numeric[i] = num_addr;
+            continue;
         }
 
         // Pass through the same numeric pointer for the XLA dependency edge
@@ -1086,8 +1133,10 @@ ffi::Error solve_with_numeric_impl(
         klu_numeric* Numeric = reinterpret_cast<klu_numeric*>(num_addr);
         KluTraits<T>::solve(Symbolic, Numeric, n_col, n_rhs, &_x_temp[n], &Common);
 
+        // A failed solve fills this batch element's output with NaN instead of aborting the
+        // whole call, mirroring how LAPACK-backed solvers behave on a singular system.
         if (Common.status < KLU_OK) {
-            return ffi::Error::InvalidArgument("klu_solve/z_solve failed");
+            fill_nan(&_x_temp[n], n_rhs * n_col);
         }
     }
 
@@ -1219,8 +1268,10 @@ ffi::Error tsolve_with_numeric_impl(
         // NOTE: tsolve instead of solve
         KluTraits<T>::tsolve(Symbolic, Numeric, n_col, n_rhs, &_x_temp[n], &Common);
 
+        // A failed solve fills this batch element's output with NaN instead of aborting the
+        // whole call, mirroring how LAPACK-backed solvers behave on a singular system.
         if (Common.status < KLU_OK) {
-            return ffi::Error::InvalidArgument("klu_tsolve/z_tsolve failed");
+            fill_nan(&_x_temp[n], n_rhs * n_col);
         }
     }
 
