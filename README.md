@@ -1,6 +1,6 @@
 # KLUJAX
 
-> version: 0.5.0.post2
+> version: 0.5.0.post3
 
 A sparse linear solver for JAX based on the efficient [KLU algorithm](https://ufdcimages.uflib.ufl.edu/UF/E0/01/17/21/00001/palamadai_e.pdf).
 
@@ -141,6 +141,29 @@ def fast_solve(b_t, num, sym):
 
 for i in range(100):
     x_i = fast_solve(b_batch[i], numeric, symbolic)
+```
+
+### Safe Refactorization (Status Codes & Conditioning)
+
+`klujax.refactor` reuses the pivot order picked for the original matrix. That is what makes it fast, but it also means the factorization can fail, or silently lose accuracy, once the values have drifted far enough. Two additions make that recoverable.
+
+`klujax.refactor_with_status` reports a failure through a status code rather than raising, so it can be branched on under `jax.jit` where an error would abort everything. `klujax.refactor_and_solve_with_status` does the same for the fused path.
+
+```python
+numeric, status = klujax.refactor_with_status(Ai, Aj, Ax_new, numeric, symbolic)
+if status[0] != klujax.KLUStatus.OK:
+    # the numeric object is unusable for a solve, but the symbolic one is fine
+    klujax.free_numeric(numeric)
+    numeric = klujax.factor(Ai, Aj, Ax_new, symbolic)
+```
+
+When `status != OK` the numeric object may be partially overwritten and must not be used for a solve. It remains valid to pass to `free_numeric`, and the symbolic object is unaffected and may be reused for a fresh `factor`.
+
+Degradation short of outright failure is caught by `klujax.rcond`, the reciprocal pivot growth estimate `min|Uii| / max|Uii|`. It costs O(n), far less than solving with a probe vector and measuring the residual. `klujax.condest` gives a proper 1-norm condition number estimate and is the usual follow-up when `rcond` is borderline.
+
+```python
+if klujax.rcond(symbolic, numeric)[0] < 1e-10:
+    ...  # pivots have degraded, re-factor from scratch
 ```
 
 ### Lifecycle & Pointer Pitfalls

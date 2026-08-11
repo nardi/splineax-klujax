@@ -788,6 +788,309 @@ def test_solve_batched_partially_singular(dtype):
     _log_and_test_equality(x[well_posed], x_sp[well_posed])
 
 
+# Refactor status and conditioning testing
+
+
+def parametrize_modes(func):
+    """Run a test both eagerly and under jax.jit.
+
+    Branching on a refactor failure is only useful if it survives tracing, so every new
+    entry point is checked in both modes.
+    """
+    return pytest.mark.parametrize("mode", ["eager", "jit"])(func)
+
+
+def _run(mode, f, *args):
+    return f(*args) if mode == "eager" else jax.jit(f)(*args)
+
+
+def _get_zero_pivot_arrs(*, dtype, n_lhs=None):
+    """A 2x2 dense matrix plus value sets that reuse its pivot order.
+
+    Returns (Ai, Aj, Ax_ok, Ax_singular, Ax_near_singular, b). Ax_singular has two equal
+    rows, so under the pivot order of Ax_ok the second pivot is exactly zero. The block
+    has to be dense: KLU only checks for a zero pivot inside BTF blocks larger than 1x1,
+    so a diagonal matrix would refactor without complaint.
+
+    With n_lhs set, the value arrays are batched and only the last left-hand side is
+    singular (respectively near-singular).
+    """
+    Ai = jnp.array([0, 0, 1, 1], dtype=jnp.int32)
+    Aj = jnp.array([0, 1, 0, 1], dtype=jnp.int32)
+    ok = jnp.array([1.0, 1.0, 1.0, 2.0], dtype=dtype)
+    singular = jnp.array([1.0, 1.0, 1.0, 1.0], dtype=dtype)
+    near = jnp.array([1.0, 1.0, 1.0, 1.0 + 1e-14], dtype=dtype)
+    b = jnp.array([3.0, 1.0], dtype=dtype)
+
+    if n_lhs is not None:
+        stack = lambda last: jnp.stack([ok] * (n_lhs - 1) + [last])  # noqa: E731
+        ok, singular, near = stack(ok), stack(singular), stack(near)
+        b = jnp.broadcast_to(b, (n_lhs, b.shape[0]))
+
+    return Ai, Aj, ok, singular, near, b
+
+
+@log_test_name
+@parametrize_dtypes
+@parametrize_modes
+def test_refactor_with_status_ok(dtype, mode):
+    Ai, Aj, Ax, _, _, b = _get_zero_pivot_arrs(dtype=dtype)
+    sym = klujax.analyze(Ai, Aj, 2)
+    num = klujax.factor(Ai, Aj, Ax, sym)
+
+    def f(ax):
+        _, status = klujax.refactor_with_status(Ai, Aj, ax, num, sym)
+        return status
+
+    status = _run(mode, f, Ax)
+    assert status.tolist() == [klujax.KLUStatus.OK]
+
+    x_sp = klujax.solve_with_numeric(num, b, sym)
+    A = jnp.zeros((2, 2), dtype=dtype).at[Ai, Aj].add(Ax)
+    _log_and_test_equality(jsp.linalg.solve(A, b), x_sp)
+
+    klujax.free_numeric(num)
+    klujax.free_symbolic(sym)
+
+
+@log_test_name
+@parametrize_dtypes
+@parametrize_modes
+def test_refactor_with_status_singular(dtype, mode):
+    """A zero pivot must be reported, not raised. This is the whole point: under jit an
+    error aborts the computation and cannot be branched on."""
+    Ai, Aj, Ax, Ax_singular, _, _ = _get_zero_pivot_arrs(dtype=dtype)
+    sym = klujax.analyze(Ai, Aj, 2)
+    num = klujax.factor(Ai, Aj, Ax, sym)
+
+    def f(ax):
+        _, status = klujax.refactor_with_status(Ai, Aj, ax, num, sym)
+        return status
+
+    status = _run(mode, f, Ax_singular)
+    assert status.tolist() == [klujax.KLUStatus.SINGULAR]
+
+    # the plain refactor does raise on the very same input
+    with pytest.raises(Exception, match="refactor"):
+        klujax.refactor(Ai, Aj, Ax_singular, num, sym)
+
+    klujax.free_numeric(num)
+    klujax.free_symbolic(sym)
+
+
+@log_test_name
+@parametrize_dtypes
+def test_refactor_with_status_branch_under_jit(dtype):
+    """The status must be usable as a traced value, so a caller can fall back to a fresh
+    factorization from inside a jitted function."""
+    Ai, Aj, Ax, Ax_singular, _, b = _get_zero_pivot_arrs(dtype=dtype)
+    sym = klujax.analyze(Ai, Aj, 2)
+    num = klujax.factor(Ai, Aj, Ax, sym)
+
+    @jax.jit
+    def f(ax):
+        num2, status = klujax.refactor_with_status(Ai, Aj, ax, num, sym)
+        x = klujax.solve_with_numeric(num2, b, sym)
+        # on failure, report a zero solution instead of the unusable factorization
+        return lax.cond(
+            status[0] == klujax.KLUStatus.OK,
+            lambda: x,
+            lambda: jnp.zeros_like(x),
+        )
+
+    assert jnp.all(f(Ax_singular) == 0)
+    A = jnp.zeros((2, 2), dtype=dtype).at[Ai, Aj].add(Ax)
+    _log_and_test_equality(jsp.linalg.solve(A, b), f(Ax))
+
+    klujax.free_numeric(num)
+    klujax.free_symbolic(sym)
+
+
+@log_test_name
+@parametrize_dtypes
+def test_factor_after_singular_status(dtype):
+    """Documented contract: after a failed refactor the symbolic object is unaffected and
+    the numeric object is still safe to free."""
+    Ai, Aj, Ax, Ax_singular, _, b = _get_zero_pivot_arrs(dtype=dtype)
+    sym = klujax.analyze(Ai, Aj, 2)
+    num = klujax.factor(Ai, Aj, Ax, sym)
+
+    _, status = klujax.refactor_with_status(Ai, Aj, Ax_singular, num, sym)
+    assert status.tolist() == [klujax.KLUStatus.SINGULAR]
+
+    klujax.free_numeric(num)
+
+    num2 = klujax.factor(Ai, Aj, Ax, sym)
+    x_sp = klujax.solve_with_numeric(num2, b, sym)
+    A = jnp.zeros((2, 2), dtype=dtype).at[Ai, Aj].add(Ax)
+    _log_and_test_equality(jsp.linalg.solve(A, b), x_sp)
+
+    klujax.free_numeric(num2)
+    klujax.free_symbolic(sym)
+
+
+@log_test_name
+@parametrize_dtypes
+@parametrize_modes
+def test_refactor_with_status_batched(dtype, mode):
+    n_lhs = 3
+    Ai, Aj, Ax, Ax_singular, _, _ = _get_zero_pivot_arrs(dtype=dtype, n_lhs=n_lhs)
+    sym = klujax.analyze(Ai, Aj, 2)
+    num = klujax.factor(Ai, Aj, Ax, sym)
+
+    def f(ax):
+        _, status = klujax.refactor_with_status(Ai, Aj, ax, num, sym)
+        return status
+
+    # only the last left-hand side is singular, the rest still refactor fine
+    status = _run(mode, f, Ax_singular)
+    assert status.tolist() == [klujax.KLUStatus.OK] * (n_lhs - 1) + [
+        klujax.KLUStatus.SINGULAR
+    ]
+
+    klujax.free_numeric(num)
+    klujax.free_symbolic(sym)
+
+
+@log_test_name
+@parametrize_dtypes
+@parametrize_modes
+def test_refactor_with_status_vmap(dtype, mode):
+    n_lhs, batch = 2, 3
+    Ai, Aj, Ax, Ax_singular, _, _ = _get_zero_pivot_arrs(dtype=dtype, n_lhs=n_lhs)
+    sym = klujax.analyze(Ai, Aj, 2)
+    num = klujax.factor(Ai, Aj, Ax, sym)
+
+    # one batch element gets the singular values, the others the benign ones
+    Ax_batched = jnp.stack([Ax] * (batch - 1) + [Ax_singular])
+
+    def f(ax):
+        _, status = klujax.refactor_with_status(Ai, Aj, ax, num, sym)
+        return status
+
+    status = _run(mode, jax.vmap(f), Ax_batched)
+    assert status.shape == (batch, n_lhs)
+    assert jnp.all(status[: batch - 1] == klujax.KLUStatus.OK)
+    assert status[batch - 1, n_lhs - 1] == klujax.KLUStatus.SINGULAR
+
+    klujax.free_numeric(num)
+    klujax.free_symbolic(sym)
+
+
+@log_test_name
+@parametrize_dtypes
+@parametrize_modes
+def test_refactor_and_solve_with_status(dtype, mode):
+    Ai, Aj, Ax, Ax_singular, _, b = _get_zero_pivot_arrs(dtype=dtype)
+    sym = klujax.analyze(Ai, Aj, 2)
+
+    # The numeric object lives entirely inside f, so the fused call gets a fresh one on
+    # every case and (under jit) has to work with a traced handle.
+    def f(ax):
+        num = klujax.factor(Ai, Aj, Ax, sym)
+        x, _, status = klujax.refactor_and_solve_with_status(Ai, Aj, ax, b, num, sym)
+        klujax.free_numeric(num, dependency=x)
+        return x, status
+
+    # a failed element reports the status and still gets a NaN solution
+    x_sp, status = _run(mode, f, Ax_singular)
+    assert status.tolist() == [klujax.KLUStatus.SINGULAR]
+    assert jnp.all(jnp.isnan(x_sp))
+
+    x_sp, status = _run(mode, f, Ax)
+    assert status.tolist() == [klujax.KLUStatus.OK]
+    A = jnp.zeros((2, 2), dtype=dtype).at[Ai, Aj].add(Ax)
+    _log_and_test_equality(jsp.linalg.solve(A, b), x_sp)
+
+    klujax.free_symbolic(sym)
+
+
+@log_test_name
+@parametrize_dtypes
+@parametrize_modes
+def test_rcond(dtype, mode):
+    Ai, Aj, Ax, _, Ax_near, _ = _get_zero_pivot_arrs(dtype=dtype)
+    sym = klujax.analyze(Ai, Aj, 2)
+
+    def f(ax):
+        num = klujax.factor(Ai, Aj, ax, sym)
+        value = klujax.rcond(sym, num, dtype=dtype)
+        klujax.free_numeric(num, dependency=value)
+        return value
+
+    # well conditioned: min|Uii| / max|Uii| = 1/2 here
+    assert _run(mode, f, Ax).tolist() == pytest.approx([0.5])
+
+    # reused-pivot degradation shows up directly, without a probe solve
+    assert 0.0 < _run(mode, f, Ax_near)[0] < 1e-13
+
+    klujax.free_symbolic(sym)
+
+
+@log_test_name
+@parametrize_dtypes
+@parametrize_modes
+def test_condest(dtype, mode):
+    Ai, Aj, Ax, _, Ax_near, _ = _get_zero_pivot_arrs(dtype=dtype)
+    sym = klujax.analyze(Ai, Aj, 2)
+
+    def f(ax):
+        num = klujax.factor(Ai, Aj, ax, sym)
+        value = klujax.condest(Ai, Aj, ax, sym, num)
+        klujax.free_numeric(num, dependency=value)
+        return value
+
+    assert _run(mode, f, Ax)[0] == pytest.approx(9.0)
+    assert _run(mode, f, Ax_near)[0] > 1e13
+
+    klujax.free_symbolic(sym)
+
+
+@log_test_name
+@parametrize_dtypes
+@parametrize_modes
+def test_rcond_and_condest_batched(dtype, mode):
+    n_lhs = 3
+    Ai, Aj, _, _, Ax_near, _ = _get_zero_pivot_arrs(dtype=dtype, n_lhs=n_lhs)
+    sym = klujax.analyze(Ai, Aj, 2)
+
+    def f(ax):
+        num = klujax.factor(Ai, Aj, ax, sym)
+        values = klujax.rcond(sym, num, dtype=dtype)
+        conds = klujax.condest(Ai, Aj, ax, sym, num)
+        klujax.free_numeric(num, dependency=conds)
+        return values, conds
+
+    # only the last left-hand side is near-singular
+    values, conds = _run(mode, f, Ax_near)
+    assert values.shape == (n_lhs,)
+    assert jnp.all(values[: n_lhs - 1] > 0.1)
+    assert values[n_lhs - 1] < 1e-13
+    assert conds[n_lhs - 1] > 1e13
+
+    klujax.free_symbolic(sym)
+
+
+@log_test_name
+@parametrize_dtypes
+def test_rcond_vmap(dtype):
+    n_lhs, batch = 2, 3
+    Ai, Aj, Ax, _, Ax_near, _ = _get_zero_pivot_arrs(dtype=dtype, n_lhs=n_lhs)
+    sym = klujax.analyze(Ai, Aj, 2)
+    # one batch element carries the near-singular values, the others the benign ones
+    Ax_batched = jnp.stack([Ax] * (batch - 1) + [Ax_near])
+
+    nums = jax.vmap(lambda ax: klujax.factor(Ai, Aj, ax, sym).handle)(Ax_batched)
+    values = jax.vmap(lambda h: klujax.rcond(sym, h, dtype=dtype))(nums)
+
+    assert values.shape == (batch, n_lhs)
+    assert jnp.all(values[: batch - 1] > 0.1)
+    assert values[batch - 1, n_lhs - 1] < 1e-13
+
+    jax.vmap(klujax.free_numeric)(nums)
+    klujax.free_symbolic(sym)
+
+
 # KLUHandleManager testing
 
 

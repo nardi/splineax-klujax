@@ -38,7 +38,7 @@ license-files = ["LICENSE"]
 name = "splineax-klujax"
 readme = "README.md"
 requires-python = ">=3.11"
-version = "0.5.0.post2"
+version = "0.5.0.post3"
 
 [[tool.bver.file]]
 src = "README.md"
