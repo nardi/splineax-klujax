@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.0.post3
+
+- New `refactor_with_status` and `refactor_and_solve_with_status` report a failed
+  refactorization through a `KLUStatus` code instead of raising, so callers can
+  branch on it under `jax.jit` and fall back to a fresh `factor`
+- New `KLUStatus` IntEnum mirroring the SuiteSparse `KLU_*` status codes
+- New `rcond` and `condest` expose `klu_rcond` and `klu_condest`, giving a cheap
+  conditioning check on an existing factorization
+
 ## 0.5.0.post2
 
 - `solve`, `solve_with_symbol`, `tsolve_with_symbol`, `solve_with_numeric`,

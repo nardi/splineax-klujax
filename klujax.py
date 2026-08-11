@@ -6,14 +6,19 @@ __version__ = "0.5.0"
 __author__ = "Floris Laporte"
 __all__ = [
     "KLUMemoryLeakWarning",
+    "KLUStatus",
     "analyze",
     "coalesce",
+    "condest",
     "dot",
     "factor",
     "free_numeric",
     "free_symbolic",
+    "rcond",
     "refactor",
     "refactor_and_solve",
+    "refactor_and_solve_with_status",
+    "refactor_with_status",
     "solve",
     "solve_with_numeric",
     "solve_with_symbol",
@@ -24,10 +29,12 @@ __all__ = [
 # Imports =============================================================================
 
 import contextlib
+import enum
 import os
 import sys
 import warnings
 from collections.abc import Callable
+from functools import partial
 from types import TracebackType
 from typing import Any, Self
 
@@ -201,6 +208,20 @@ def coalesce(
 
 class KLUMemoryLeakWarning(UserWarning):
     """Warn that a handle was likely garbage-collected without being freed."""
+
+
+class KLUStatus(enum.IntEnum):
+    """KLU status codes, mirroring the KLU_* constants in SuiteSparse.
+
+    Returned by refactor_with_status and refactor_and_solve_with_status. Values
+    above OK are warnings, values below it are errors.
+    """
+
+    OK = 0
+    SINGULAR = 1
+    OUT_OF_MEMORY = -2
+    INVALID = -3
+    TOO_LARGE = -4
 
 
 class KLUHandleManager:
@@ -559,6 +580,134 @@ def refactor(
 
 
 @jax.jit
+def _refactor_with_status_jit(
+    Ai: Array, Aj: Array, Ax: Array, sym_h: Array, num_h: Array
+) -> tuple[Array, Array]:
+    dummy_b = jnp.zeros((1,), dtype=Ax.dtype)
+    Ai, Aj, Ax, _, _ = validate_args(Ai, Aj, Ax, dummy_b)
+    prim = refactor_status_c128 if Ax.dtype in COMPLEX_DTYPES else refactor_status_f64
+    raw_handle, status = prim.bind(
+        Ai.astype(jnp.int32), Aj.astype(jnp.int32), Ax, sym_h, num_h
+    )
+    return raw_handle, status
+
+
+def refactor_with_status(
+    Ai: Array,
+    Aj: Array,
+    Ax: Array,
+    numeric: KLUHandleManager | Array,
+    symbolic: KLUHandleManager | Array,
+) -> tuple[KLUHandleManager, Array]:
+    """Like refactor(), but reports failure through a status code instead of raising.
+
+    refactor() turns a failed klu_refactor into an error, which aborts the whole
+    computation under jax.jit and cannot be caught or branched on. This variant always
+    succeeds and returns the KLU status per left-hand side, so a caller can fall back to
+    a fresh factor() from inside a jitted function.
+
+    When status != KLUStatus.OK the numeric object may be partially overwritten and must
+    not be used for a solve. It remains valid to pass to free_numeric, and the symbolic
+    object is unaffected and may be reused for a fresh factor().
+
+    Args:
+        Ai: [n_nz; int32]: the row indices of the sparse matrix A
+        Aj: [n_nz; int32]: the column indices of the sparse matrix A
+        Ax: [n_lhs? x n_nz; float64|complex128]: the values of the sparse matrix A
+        numeric: [KLUHandleManager|Array]: existing numeric factorization
+            (modified in-place)
+        symbolic: [KLUHandleManager|Array]: the symbolic analysis object or handle
+
+    Returns:
+        (numeric, status): the updated numeric handle (same pointer, for XLA dep
+            tracking) and [n_lhs; int32] of KLUStatus values
+
+    """
+    _require_x64()
+    num_h = getattr(numeric, "handle", numeric)
+    sym_h = getattr(symbolic, "handle", symbolic)
+    raw_handle, status = _refactor_with_status_jit(Ai, Aj, Ax, sym_h, num_h)
+    return KLUHandleManager(raw_handle, free_numeric, owner=False), status
+
+
+@partial(jax.jit, static_argnames=("is_complex",))
+def _rcond_jit(sym_h: Array, num_h: Array, *, is_complex: bool) -> Array:
+    prim = rcond_c128 if is_complex else rcond_f64
+    return prim.bind(sym_h.astype(jnp.uint64), num_h.astype(jnp.uint64))
+
+
+def rcond(
+    symbolic: KLUHandleManager | Array,
+    numeric: KLUHandleManager | Array,
+    *,
+    dtype: Any = jnp.float64,  # noqa: ANN401
+) -> Array:
+    """Reciprocal pivot growth estimate min|Uii| / max|Uii| of a factorization.
+
+    Computed by klu_rcond in O(n), so it is far cheaper than a probe solve. Use it
+    to detect pivot degradation after a refactor() that reuses an older pivot order.
+    A value near 1 is well conditioned, a tiny value means the reused pivots have
+    gone bad, and 0 means the factorization is singular.
+
+    A numeric handle does not record whether it was built from real or complex
+    values, so pass the dtype it was factored with.
+
+    Args:
+        symbolic: [KLUHandleManager|Array]: the symbolic analysis object or handle
+        numeric: [KLUHandleManager|Array]: the numeric factorization object or handle
+        dtype: the dtype the factorization was built with (float64 or complex128)
+
+    Returns:
+        rcond: [n_lhs; float64]
+
+    """
+    _require_x64()
+    num_h = getattr(numeric, "handle", numeric)
+    sym_h = getattr(symbolic, "handle", symbolic)
+    is_complex = jnp.dtype(dtype) in COMPLEX_DTYPES
+    return _rcond_jit(sym_h, num_h, is_complex=is_complex)
+
+
+@jax.jit
+def _condest_jit(Ai: Array, Aj: Array, Ax: Array, sym_h: Array, num_h: Array) -> Array:
+    dummy_b = jnp.zeros((1,), dtype=Ax.dtype)
+    Ai, Aj, Ax, _, _ = validate_args(Ai, Aj, Ax, dummy_b)
+    prim = condest_c128 if Ax.dtype in COMPLEX_DTYPES else condest_f64
+    return prim.bind(Ai.astype(jnp.int32), Aj.astype(jnp.int32), Ax, sym_h, num_h)
+
+
+def condest(
+    Ai: Array,
+    Aj: Array,
+    Ax: Array,
+    symbolic: KLUHandleManager | Array,
+    numeric: KLUHandleManager | Array,
+) -> Array:
+    """1-norm condition number estimate of A, given its factorization.
+
+    Uses klu_condest, which applies Hager's method as modified by Higham and
+    Tisseur, the same method as MATLAB's condest. More accurate but more expensive
+    than rcond(), so the usual pattern is to reach for it only when rcond() is
+    borderline. A singular factorization gives infinity.
+
+    Args:
+        Ai: [n_nz; int32]: the row indices of the sparse matrix A
+        Aj: [n_nz; int32]: the column indices of the sparse matrix A
+        Ax: [n_lhs? x n_nz; float64|complex128]: the values of the sparse matrix A
+        symbolic: [KLUHandleManager|Array]: the symbolic analysis object or handle
+        numeric: [KLUHandleManager|Array]: the numeric factorization of A
+
+    Returns:
+        condest: [n_lhs; float64]
+
+    """
+    _require_x64()
+    num_h = getattr(numeric, "handle", numeric)
+    sym_h = getattr(symbolic, "handle", symbolic)
+    return _condest_jit(Ai, Aj, Ax, sym_h, num_h)
+
+
+@jax.jit
 def _solve_with_numeric_jit(num_h: Array, b: Array, sym_h: Array) -> Array:
     prim = (
         solve_with_numeric_c128 if b.dtype in COMPLEX_DTYPES else solve_with_numeric_f64
@@ -688,6 +837,70 @@ def refactor_and_solve(
     return x, KLUHandleManager(raw_numeric, free_numeric, owner=False)
 
 
+@jax.jit
+def _refactor_and_solve_with_status_jit(
+    Ai: Array, Aj: Array, Ax: Array, b: Array, sym_h: Array, num_h: Array
+) -> tuple[Array, Array, Array]:
+    Ai, Aj, Ax, b, out_shape = validate_numeric_solve(Ai, Aj, Ax, b)
+
+    is_complex = any(x.dtype in COMPLEX_DTYPES for x in (Ax, b))
+    prim = (
+        refactor_and_solve_status_c128 if is_complex else refactor_and_solve_status_f64
+    )
+
+    x, out_num, status = prim.bind(
+        Ai.astype(jnp.int32),
+        Aj.astype(jnp.int32),
+        Ax.astype(jnp.complex128 if is_complex else jnp.float64),
+        b.astype(jnp.complex128 if is_complex else jnp.float64),
+        sym_h.astype(jnp.uint64),
+        num_h.astype(jnp.uint64),
+    )
+
+    return x.reshape(*out_shape), out_num, status
+
+
+def refactor_and_solve_with_status(
+    Ai: Array,
+    Aj: Array,
+    Ax: Array,
+    b: Array,
+    numeric: KLUHandleManager | Array,
+    symbolic: KLUHandleManager | Array,
+) -> tuple[Array, KLUHandleManager, Array]:
+    """Like refactor_and_solve(), but also reports the KLU status per left-hand side.
+
+    Lets the fused path be used from the same branching code as refactor_with_status().
+    A failed element still gets its solution filled with NaN, so either signal works.
+
+    The contract on the numeric object is the same as for refactor_with_status(): when
+    status != KLUStatus.OK it must not be used for a solve, but it is still safe to free
+    and the symbolic object may be reused for a fresh factor().
+
+    Args:
+        Ai: [n_nz; int32]: the row indices of the sparse matrix A
+        Aj: [n_nz; int32]: the column indices of the sparse matrix A
+        Ax: [n_lhs? x n_nz; float64|complex128]: the values of the sparse matrix A
+        b:  [n_lhs? x n_col x n_rhs?; float64|complex128]: the right-hand side
+        numeric: [KLUHandleManager|Array]: existing numeric factorization
+            (modified in-place)
+        symbolic: [KLUHandleManager|Array]: the symbolic analysis object or handle
+
+    Returns:
+        (x, numeric, status): solution array (NaN where the refactor failed), the
+            updated numeric handle (same pointer, owner=False) and [n_lhs; int32] of
+            KLUStatus values
+
+    """
+    _require_x64()
+    num_h = getattr(numeric, "handle", numeric)
+    sym_h = getattr(symbolic, "handle", symbolic)
+    x, raw_numeric, status = _refactor_and_solve_with_status_jit(
+        Ai, Aj, Ax, b, sym_h, num_h
+    )
+    return x, KLUHandleManager(raw_numeric, free_numeric, owner=False), status
+
+
 # Primitives ==========================================================================
 
 dot_f64 = jax.extend.core.Primitive("dot_f64")
@@ -713,6 +926,22 @@ refactor_and_solve_f64 = jax.extend.core.Primitive("refactor_and_solve_f64")
 refactor_and_solve_c128 = jax.extend.core.Primitive("refactor_and_solve_c128")
 refactor_and_solve_f64.multiple_results = True
 refactor_and_solve_c128.multiple_results = True
+refactor_status_f64 = jax.extend.core.Primitive("refactor_status_f64")
+refactor_status_c128 = jax.extend.core.Primitive("refactor_status_c128")
+refactor_and_solve_status_f64 = jax.extend.core.Primitive(
+    "refactor_and_solve_status_f64"
+)
+refactor_and_solve_status_c128 = jax.extend.core.Primitive(
+    "refactor_and_solve_status_c128"
+)
+refactor_status_f64.multiple_results = True
+refactor_status_c128.multiple_results = True
+refactor_and_solve_status_f64.multiple_results = True
+refactor_and_solve_status_c128.multiple_results = True
+rcond_f64 = jax.extend.core.Primitive("rcond_f64")
+rcond_c128 = jax.extend.core.Primitive("rcond_c128")
+condest_f64 = jax.extend.core.Primitive("condest_f64")
+condest_c128 = jax.extend.core.Primitive("condest_c128")
 
 # Implementations ========================================================
 
@@ -806,6 +1035,65 @@ def refactor_c128_impl(Ai, Aj, Ax, symbolic, numeric):
     return call(Ai, Aj, Ax, symbolic, numeric)
 
 
+@refactor_status_f64.def_impl
+def refactor_status_f64_impl(Ai, Aj, Ax, symbolic, numeric):
+    n_lhs = Ax.shape[0]
+    call = jax.ffi.ffi_call(
+        "refactor_status_f64",
+        (
+            jax.ShapeDtypeStruct((n_lhs,), jnp.uint64),
+            jax.ShapeDtypeStruct((n_lhs,), jnp.int32),
+        ),
+        has_side_effect=True,
+    )
+    return call(Ai, Aj, Ax, symbolic, numeric)
+
+
+@refactor_status_c128.def_impl
+def refactor_status_c128_impl(Ai, Aj, Ax, symbolic, numeric):
+    n_lhs = Ax.shape[0]
+    call = jax.ffi.ffi_call(
+        "refactor_status_c128",
+        (
+            jax.ShapeDtypeStruct((n_lhs,), jnp.uint64),
+            jax.ShapeDtypeStruct((n_lhs,), jnp.int32),
+        ),
+        has_side_effect=True,
+    )
+    return call(Ai, Aj, Ax, symbolic, numeric)
+
+
+# rcond and condest only read an existing numeric object, so no has_side_effect here.
+@rcond_f64.def_impl
+def rcond_f64_impl(symbolic, numeric):
+    call = jax.ffi.ffi_call(
+        "rcond_f64", jax.ShapeDtypeStruct(numeric.shape, jnp.float64)
+    )
+    return call(symbolic, numeric)
+
+
+@rcond_c128.def_impl
+def rcond_c128_impl(symbolic, numeric):
+    call = jax.ffi.ffi_call(
+        "rcond_c128", jax.ShapeDtypeStruct(numeric.shape, jnp.float64)
+    )
+    return call(symbolic, numeric)
+
+
+@condest_f64.def_impl
+def condest_f64_impl(Ai, Aj, Ax, symbolic, numeric):
+    n_lhs = Ax.shape[0]
+    call = jax.ffi.ffi_call("condest_f64", jax.ShapeDtypeStruct((n_lhs,), jnp.float64))
+    return call(Ai, Aj, Ax, symbolic, numeric)
+
+
+@condest_c128.def_impl
+def condest_c128_impl(Ai, Aj, Ax, symbolic, numeric):
+    n_lhs = Ax.shape[0]
+    call = jax.ffi.ffi_call("condest_c128", jax.ShapeDtypeStruct((n_lhs,), jnp.float64))
+    return call(Ai, Aj, Ax, symbolic, numeric)
+
+
 @solve_with_numeric_f64.def_impl
 def solve_with_numeric_f64_impl(symbolic, numeric, b):
     call = jax.ffi.ffi_call(
@@ -859,6 +1147,34 @@ def refactor_and_solve_c128_impl(Ai, Aj, Ax, b, symbolic, numeric):
         (
             jax.ShapeDtypeStruct(b.shape, b.dtype),
             jax.ShapeDtypeStruct((n_lhs,), jnp.uint64),
+        ),
+    )
+    return call(Ai, Aj, Ax, b, symbolic, numeric)
+
+
+@refactor_and_solve_status_f64.def_impl
+def refactor_and_solve_status_f64_impl(Ai, Aj, Ax, b, symbolic, numeric):
+    n_lhs = Ax.shape[0]
+    call = jax.ffi.ffi_call(
+        "refactor_and_solve_status_f64",
+        (
+            jax.ShapeDtypeStruct(b.shape, b.dtype),
+            jax.ShapeDtypeStruct((n_lhs,), jnp.uint64),
+            jax.ShapeDtypeStruct((n_lhs,), jnp.int32),
+        ),
+    )
+    return call(Ai, Aj, Ax, b, symbolic, numeric)
+
+
+@refactor_and_solve_status_c128.def_impl
+def refactor_and_solve_status_c128_impl(Ai, Aj, Ax, b, symbolic, numeric):
+    n_lhs = Ax.shape[0]
+    call = jax.ffi.ffi_call(
+        "refactor_and_solve_status_c128",
+        (
+            jax.ShapeDtypeStruct(b.shape, b.dtype),
+            jax.ShapeDtypeStruct((n_lhs,), jnp.uint64),
+            jax.ShapeDtypeStruct((n_lhs,), jnp.int32),
         ),
     )
     return call(Ai, Aj, Ax, b, symbolic, numeric)
@@ -1066,6 +1382,60 @@ refactor_and_solve_c128_low = mlir.lower_fun(
 )
 mlir.register_lowering(refactor_and_solve_c128, refactor_and_solve_c128_low)
 
+jax.ffi.register_ffi_target(
+    "refactor_status_f64", klujax_cpp.refactor_status_f64(), platform="cpu"
+)
+refactor_status_f64_low = mlir.lower_fun(
+    refactor_status_f64_impl, multiple_results=True
+)
+mlir.register_lowering(refactor_status_f64, refactor_status_f64_low)
+
+jax.ffi.register_ffi_target(
+    "refactor_status_c128", klujax_cpp.refactor_status_c128(), platform="cpu"
+)
+refactor_status_c128_low = mlir.lower_fun(
+    refactor_status_c128_impl, multiple_results=True
+)
+mlir.register_lowering(refactor_status_c128, refactor_status_c128_low)
+
+jax.ffi.register_ffi_target(
+    "refactor_and_solve_status_f64",
+    klujax_cpp.refactor_and_solve_status_f64(),
+    platform="cpu",
+)
+refactor_and_solve_status_f64_low = mlir.lower_fun(
+    refactor_and_solve_status_f64_impl, multiple_results=True
+)
+mlir.register_lowering(refactor_and_solve_status_f64, refactor_and_solve_status_f64_low)
+
+jax.ffi.register_ffi_target(
+    "refactor_and_solve_status_c128",
+    klujax_cpp.refactor_and_solve_status_c128(),
+    platform="cpu",
+)
+refactor_and_solve_status_c128_low = mlir.lower_fun(
+    refactor_and_solve_status_c128_impl, multiple_results=True
+)
+mlir.register_lowering(
+    refactor_and_solve_status_c128, refactor_and_solve_status_c128_low
+)
+
+jax.ffi.register_ffi_target("rcond_f64", klujax_cpp.rcond_f64(), platform="cpu")
+rcond_f64_low = mlir.lower_fun(rcond_f64_impl, multiple_results=False)
+mlir.register_lowering(rcond_f64, rcond_f64_low)
+
+jax.ffi.register_ffi_target("rcond_c128", klujax_cpp.rcond_c128(), platform="cpu")
+rcond_c128_low = mlir.lower_fun(rcond_c128_impl, multiple_results=False)
+mlir.register_lowering(rcond_c128, rcond_c128_low)
+
+jax.ffi.register_ffi_target("condest_f64", klujax_cpp.condest_f64(), platform="cpu")
+condest_f64_low = mlir.lower_fun(condest_f64_impl, multiple_results=False)
+mlir.register_lowering(condest_f64, condest_f64_low)
+
+jax.ffi.register_ffi_target("condest_c128", klujax_cpp.condest_c128(), platform="cpu")
+condest_c128_low = mlir.lower_fun(condest_c128_impl, multiple_results=False)
+mlir.register_lowering(condest_c128, condest_c128_low)
+
 free_numeric_low = mlir.lower_fun(free_numeric_impl, multiple_results=False)
 mlir.register_lowering(free_numeric_p, free_numeric_low)
 
@@ -1127,6 +1497,38 @@ def solve_with_numeric_abstract_eval(symbolic, numeric, b):
 def refactor_and_solve_abstract_eval(Ai, Aj, Ax, b, symbolic, numeric):
     # Returns (x with same shape as b, out_numeric with same shape as numeric)
     return ShapedArray(b.shape, b.dtype), ShapedArray(numeric.shape, jnp.uint64)
+
+
+@refactor_status_f64.def_abstract_eval
+@refactor_status_c128.def_abstract_eval
+def refactor_status_abstract_eval(Ai, Aj, Ax, symbolic, numeric):
+    # As refactor, plus one KLU status code per left-hand side
+    return (
+        ShapedArray((Ax.shape[0],), jnp.uint64),
+        ShapedArray((Ax.shape[0],), jnp.int32),
+    )
+
+
+@refactor_and_solve_status_f64.def_abstract_eval
+@refactor_and_solve_status_c128.def_abstract_eval
+def refactor_and_solve_status_abstract_eval(Ai, Aj, Ax, b, symbolic, numeric):
+    return (
+        ShapedArray(b.shape, b.dtype),
+        ShapedArray(numeric.shape, jnp.uint64),
+        ShapedArray((Ax.shape[0],), jnp.int32),
+    )
+
+
+@rcond_f64.def_abstract_eval
+@rcond_c128.def_abstract_eval
+def rcond_abstract_eval(symbolic, numeric):
+    return ShapedArray(numeric.shape, jnp.float64)
+
+
+@condest_f64.def_abstract_eval
+@condest_c128.def_abstract_eval
+def condest_abstract_eval(Ai, Aj, Ax, symbolic, numeric):
+    return ShapedArray((Ax.shape[0],), jnp.float64)
 
 
 # Forward Differentiation =============================================================
@@ -1389,6 +1791,71 @@ def refactor_c128_vmap(
 batching.primitive_batchers[refactor_c128] = refactor_c128_vmap
 
 
+def refactor_status_f64_vmap(
+    vector_arg_values: tuple[Array, Array, Array, Array, Array],
+    batch_axes: tuple[int | None, int | None, int | None, int | None, int | None],
+) -> tuple[tuple[Array, Array], tuple[int, int]]:
+    return general_vmap_refactor_status(
+        refactor_status_f64, vector_arg_values, batch_axes
+    )
+
+
+batching.primitive_batchers[refactor_status_f64] = refactor_status_f64_vmap
+
+
+def refactor_status_c128_vmap(
+    vector_arg_values: tuple[Array, Array, Array, Array, Array],
+    batch_axes: tuple[int | None, int | None, int | None, int | None, int | None],
+) -> tuple[tuple[Array, Array], tuple[int, int]]:
+    return general_vmap_refactor_status(
+        refactor_status_c128, vector_arg_values, batch_axes
+    )
+
+
+batching.primitive_batchers[refactor_status_c128] = refactor_status_c128_vmap
+
+
+def condest_f64_vmap(
+    vector_arg_values: tuple[Array, Array, Array, Array, Array],
+    batch_axes: tuple[int | None, int | None, int | None, int | None, int | None],
+) -> tuple[Array, int]:
+    # condest takes the same arguments as refactor and also returns one value per lhs.
+    return general_vmap_refactor(condest_f64, vector_arg_values, batch_axes)
+
+
+batching.primitive_batchers[condest_f64] = condest_f64_vmap
+
+
+def condest_c128_vmap(
+    vector_arg_values: tuple[Array, Array, Array, Array, Array],
+    batch_axes: tuple[int | None, int | None, int | None, int | None, int | None],
+) -> tuple[Array, int]:
+    return general_vmap_refactor(condest_c128, vector_arg_values, batch_axes)
+
+
+batching.primitive_batchers[condest_c128] = condest_c128_vmap
+
+
+def rcond_f64_vmap(
+    vector_arg_values: tuple[Array, Array],
+    batch_axes: tuple[int | None, int | None],
+) -> tuple[Array, int]:
+    return general_vmap_rcond(rcond_f64, vector_arg_values, batch_axes)
+
+
+batching.primitive_batchers[rcond_f64] = rcond_f64_vmap
+
+
+def rcond_c128_vmap(
+    vector_arg_values: tuple[Array, Array],
+    batch_axes: tuple[int | None, int | None],
+) -> tuple[Array, int]:
+    return general_vmap_rcond(rcond_c128, vector_arg_values, batch_axes)
+
+
+batching.primitive_batchers[rcond_c128] = rcond_c128_vmap
+
+
 def general_vmap(
     prim: jax.extend.core.Primitive,
     vector_arg_values: tuple[Array, Array, Array, Array],
@@ -1621,11 +2088,16 @@ def general_vmap_factor(
     raise ValueError(msg)
 
 
-def general_vmap_refactor(
-    prim: jax.extend.core.Primitive,
+def _flatten_refactor_batch(
     vector_arg_values: tuple[Array, Array, Array, Array, Array],
     batch_axes: tuple[int | None, int | None, int | None, int | None, int | None],
-) -> tuple[Array, int]:
+) -> tuple[tuple[Array, Array, Array, Array, Array], tuple[int, int]]:
+    """Fold the vmap batch axis of a refactor-shaped call into n_lhs.
+
+    Returns the flattened bind arguments and the (batch, n_lhs) shape every per-lhs
+    output has to be reshaped back to. Shared by refactor, refactor_status and condest,
+    which all take (Ai, Aj, Ax, symbolic, numeric).
+    """
     Ai, Aj, Ax, symbolic, numeric = vector_arg_values
     aAi, aAj, aAx, asymbolic, anumeric = batch_axes
 
@@ -1653,11 +2125,8 @@ def general_vmap_refactor(
         batch, n_lhs, n_vals = Ax.shape
         Ax = Ax.reshape(batch * n_lhs, n_vals)
         numeric = numeric.reshape(batch * n_lhs)
-        return prim.bind(
-            Ai.astype(jnp.int32), Aj.astype(jnp.int32), Ax, symbolic, numeric
-        ).reshape(batch, n_lhs), 0
 
-    if aAx is not None:
+    elif aAx is not None:
         if Ax.ndim != 3:
             msg = f"Ax should be 3D when vectorizing over it. Got: {Ax.shape=}."
             raise ValueError(msg)
@@ -1666,11 +2135,8 @@ def general_vmap_refactor(
         numeric = jnp.broadcast_to(numeric[None], (batch, numeric.shape[0]))
         Ax = Ax.reshape(batch * n_lhs, n_vals)
         numeric = numeric.reshape(batch * n_lhs)
-        return prim.bind(
-            Ai.astype(jnp.int32), Aj.astype(jnp.int32), Ax, symbolic, numeric
-        ).reshape(batch, n_lhs), 0
 
-    if anumeric is not None:
+    elif anumeric is not None:
         if numeric.ndim != 2:
             msg = (
                 f"numeric should be 2D when vectorizing over it. Got: {numeric.shape=}."
@@ -1681,12 +2147,58 @@ def general_vmap_refactor(
         Ax = jnp.broadcast_to(Ax[None], (batch, Ax.shape[0], Ax.shape[1]))
         Ax = Ax.reshape(batch * n_lhs, Ax.shape[2])
         numeric = numeric.reshape(batch * n_lhs)
-        return prim.bind(
-            Ai.astype(jnp.int32), Aj.astype(jnp.int32), Ax, symbolic, numeric
-        ).reshape(batch, n_lhs), 0
 
-    msg = "vmap failed. Please select an axis to vectorize over."
-    raise ValueError(msg)
+    else:
+        msg = "vmap failed. Please select an axis to vectorize over."
+        raise ValueError(msg)
+
+    args = (Ai.astype(jnp.int32), Aj.astype(jnp.int32), Ax, symbolic, numeric)
+    return args, (batch, n_lhs)
+
+
+def general_vmap_refactor(
+    prim: jax.extend.core.Primitive,
+    vector_arg_values: tuple[Array, Array, Array, Array, Array],
+    batch_axes: tuple[int | None, int | None, int | None, int | None, int | None],
+) -> tuple[Array, int]:
+    args, shape = _flatten_refactor_batch(vector_arg_values, batch_axes)
+    return prim.bind(*args).reshape(*shape), 0
+
+
+def general_vmap_refactor_status(
+    prim: jax.extend.core.Primitive,
+    vector_arg_values: tuple[Array, Array, Array, Array, Array],
+    batch_axes: tuple[int | None, int | None, int | None, int | None, int | None],
+) -> tuple[tuple[Array, Array], tuple[int, int]]:
+    # As general_vmap_refactor, but the status output is batched along the same axis.
+    args, shape = _flatten_refactor_batch(vector_arg_values, batch_axes)
+    numeric, status = prim.bind(*args)
+    return (numeric.reshape(*shape), status.reshape(*shape)), (0, 0)
+
+
+def general_vmap_rcond(
+    prim: jax.extend.core.Primitive,
+    vector_arg_values: tuple[Array, Array],
+    batch_axes: tuple[int | None, int | None],
+) -> tuple[Array, int]:
+    symbolic, numeric = vector_arg_values
+    asymbolic, anumeric = batch_axes
+
+    if asymbolic is not None:
+        msg = "symbolic handle cannot be vectorized."
+        raise ValueError(msg)
+
+    if anumeric is None:
+        msg = "vmap failed. Please select an axis to vectorize over."
+        raise ValueError(msg)
+
+    if numeric.ndim != 2:
+        msg = f"numeric should be 2D when vectorizing over it. Got: {numeric.shape=}."
+        raise ValueError(msg)
+
+    numeric = jnp.moveaxis(numeric, anumeric, 0)
+    batch, n_lhs = numeric.shape
+    return prim.bind(symbolic, numeric.reshape(batch * n_lhs)).reshape(batch, n_lhs), 0
 
 
 def free_numeric_p_vmap(

@@ -25,6 +25,8 @@ nav:
       - analyze: api/analyze.md
       - factor: api/factor.md
       - refactor: api/refactor.md
+      - refactor_with_status: api/refactor-with-status.md
+      - rcond / condest: api/conditioning.md
       - solve_with_symbol: api/solve-with-symbol.md
       - solve_with_numeric: api/solve-with-numeric.md
       - free_symbolic / free_numeric: api/free.md
