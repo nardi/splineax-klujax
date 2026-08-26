@@ -1,86 +1,65 @@
 ---
 title: free_symbolic / free_numeric
-summary: Explicitly free KLU handles inside JIT
+summary: Optionally release the cache slot behind a KLU handle
 ---
 
 # free_symbolic / free_numeric
 
 ```python
-klujax.free_symbolic(symbolic, dependency=None) -> None
-klujax.free_numeric(numeric, dependency=None) -> None
+klujax.free_symbolic(symbolic, dependency=None) -> Array
+klujax.free_numeric(numeric, dependency=None) -> Array
 ```
 
-Explicitly free the C++ memory behind a KLU handle. You only need these inside `jax.jit`-compiled functions — outside JIT, handles are freed automatically.
+Release the cache slot behind a KLU token. This is **optional**: a token carries
+the arrays it needs, so a freed token rebuilds itself on next use rather than
+becoming invalid. Call these only to give the memory back sooner.
+
+`dependency` orders the free after a value, for use inside `jax.jit`. Pass the
+solution the free should wait for, so the free runs after that solve rather than
+racing it. Outside jit it is unnecessary, since Python already runs calls in
+order. `token.track(solution)` does the same by folding the solve into the token.
 
 ## Parameters
 
 ### free_symbolic
 
-| Parameter    | Type             | Description                                                   |
-| ------------ | ---------------- | ------------------------------------------------------------- |
-| `symbolic`   | KLUHandleManager | Handle from [analyze](../api/analyze.md)                      |
-| `dependency` | Array or None    | An array that must be computed **before** the handle is freed |
+| Parameter    | Type            | Description                          |
+| ------------ | --------------- | ------------------------------------ |
+| `symbolic`   | SymbolToken     | Token from [analyze](../api/analyze.md) |
+| `dependency` | Any             | Value the free is ordered after (optional) |
 
 ### free_numeric
 
-| Parameter    | Type             | Description                                                              |
-| ------------ | ---------------- | ------------------------------------------------------------------------ |
-| `numeric`    | KLUHandleManager | Handle from [factor](../api/factor.md) or [refactor](../api/refactor.md) |
-| `dependency` | Array or None    | An array that must be computed **before** the handle is freed            |
+| Parameter    | Type            | Description                                                              |
+| ------------ | --------------- | ------------------------------------------------------------------------ |
+| `numeric`    | NumericToken    | Token from [factor](../api/factor.md) or [refactor](../api/refactor.md) |
+| `dependency` | Any             | Value the free is ordered after (optional)                              |
 
-## Why dependency Matters
+## Freeing is optional
 
-Inside JIT, the XLA compiler can reorder operations. Without a dependency, the compiler might free your handle **before** the solve that uses it has finished. The `dependency` parameter tells XLA: "don't free this until the dependency array is ready."
-
-```mermaid
-flowchart TD
-    subgraph "Without dependency (WRONG)"
-        A1["analyze"] --> S1["solve_with_symbol"]
-        A1 --> F1["free_symbolic ⚠️"]
-        S1 -.->|"might run after free!"| BAD["💥 Segfault"]
-    end
-
-    subgraph "With dependency (CORRECT)"
-        A2["analyze"] --> S2["solve_with_symbol"] --> X2["x #40;result#41;"]
-        X2 --> F2["free_symbolic#40;sym, dependency=x#41;"]
-    end
-```
-
-## Example: Inside JIT
+Freeing drops the cache entry. The token stays valid, so reusing it just rebuilds
+the KLU object from the arrays the token carries:
 
 ```python
-@jax.jit
-def dynamic_solve(Ai, Aj, Ax, b):
-    # Create handle inside JIT (not ideal, but sometimes necessary)
-    sym = klujax.analyze(Ai, Aj, 5)
+numeric = klujax.factor(Ai, Aj, Ax, symbolic)
+klujax.free_numeric(numeric)          # releases the cache slot
 
-    # Solve
-    x = klujax.solve_with_symbol(Ai, Aj, Ax, b, sym)
-
-    # CRITICAL: Free with dependency to ensure correct ordering
-    klujax.free_symbolic(sym, dependency=x)
-
-    return x
+# Still works: this rebuilds the factorization, then solves.
+x = klujax.solve_with_numeric(numeric, b, symbolic)
 ```
 
-## When You Don't Need These
+The bounded cache also frees tokens for you: once it is full, the least
+recently used entry is evicted. So even if you never call these, memory stays
+bounded. See [Memory Management](../advanced/memory-management.md) for the cache
+size (`KLUJAX_FACTOR_CACHE`) and how to spot rebuilds with `rebuild_count()`.
 
-Outside JIT, handles clean up automatically:
+## When a free actually frees
 
-```python
-# This is fine — no need to call free_symbolic
-symbolic = klujax.analyze(Ai, Aj, n_col)
-x = klujax.solve_with_symbol(Ai, Aj, Ax, b, symbolic)
-# symbolic is freed when garbage collected
-```
-
-Or use a context manager:
-
-```python
-with klujax.analyze(Ai, Aj, n_col) as symbolic:
-    x = klujax.solve_with_symbol(Ai, Aj, Ax, b, symbolic)
-# Freed here
-```
-
-!!! tip
-    The best practice is to create handles **outside** JIT. Then you never need `free_symbolic` or `free_numeric` at all. See [Memory Management](../advanced/memory-management.md).
+Calling these is always safe for correctness, at any point. But a free only
+reclaims memory without forcing a wasted rebuild when it runs after the token's
+last use. That ordering is automatic when you free eagerly in Python. Inside a
+single `jax.jit` trace a bare free and a solve on the same token are unordered,
+so pass `dependency=solution` or call `token.track(solution)` to order the free
+after the solve. See
+[When is it safe to free explicitly?](../advanced/memory-management.md#when-is-it-safe-to-free-explicitly)
+for the details.

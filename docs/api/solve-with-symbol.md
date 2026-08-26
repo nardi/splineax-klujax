@@ -19,7 +19,7 @@ Solve **Ax = b** using a pre-computed symbolic analysis. This skips the expensiv
 | `Aj`       | int32                 | `(n_nz,)`                 | Column indices                    |
 | `Ax`       | float64 or complex128 | `(n_lhs?, n_nz)`          | Matrix values                     |
 | `b`        | float64 or complex128 | `(n_lhs?, n_col, n_rhs?)` | Right-hand side                   |
-| `symbolic` | KLUHandleManager      | —                         | Handle from [analyze](analyze.md) |
+| `symbolic` | SymbolToken           | —                         | Handle from [analyze](analyze.md) |
 
 ## Returns
 

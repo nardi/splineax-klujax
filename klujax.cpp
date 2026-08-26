@@ -2,12 +2,18 @@
 // Imports
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <complex>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <list>
+#include <map>
 #include <memory>
+#include <mutex>
+#include <string>
 
 #include "klu.h"
 #include "pybind11/pybind11.h"
@@ -191,6 +197,213 @@ template <>
 void fill_nan<Complex>(Complex* dst, int n) {
     std::fill(dst, dst + n,
               Complex(std::numeric_limits<double>::quiet_NaN(), std::numeric_limits<double>::quiet_NaN()));
+}
+
+// Handle cache ================================================================
+//
+// A handle is a uint64 id into this process-global cache, never a raw pointer,
+// so a stale id can never dereference freed memory. Each entry owns its KLU
+// objects and frees them when dropped. A symbolic entry owns a klu_symbolic.
+// A numeric entry also owns a klu_numeric and shares (ref-counts) the symbolic
+// it was factored against, so analysis is reused, not recomputed.
+//
+// The cache is bounded: the least recently used entry is evicted once it grows
+// past KLUJAX_FACTOR_CACHE, so forgetting to free leaks only a bounded amount.
+// A call arriving with an id no longer resident (evicted or freed) rebuilds the
+// state from the Ai/Aj/Ax the caller carries, so use of a freed handle is safe.
+
+struct SymbolicObj {
+    klu_symbolic* S = nullptr;
+    int n_col = 0;
+    ~SymbolicObj() {
+        if (S) {
+            klu_common c;
+            klu_defaults(&c);
+            klu_free_symbolic(&S, &c);
+        }
+    }
+};
+
+struct CacheEntry {
+    std::shared_ptr<SymbolicObj> symbolic;  // always set
+    klu_numeric* numeric = nullptr;         // null for a symbolic-only entry
+    ~CacheEntry() {
+        if (numeric) {
+            klu_common c;
+            klu_defaults(&c);
+            klu_free_numeric(&numeric, &c);
+        }
+    }
+};
+
+// The registry and its LRU order. Every public method takes `mu`, so callers
+// look up under the lock but do the heavy KLU work outside it (see resolve_*).
+struct CacheRegistry {
+    std::mutex mu;
+    std::map<uint64_t, std::shared_ptr<CacheEntry>> entries;
+    std::list<uint64_t> lru;  // front = most recently used
+    std::atomic<uint64_t> next_id{1};
+    std::atomic<long> rebuilds{0};
+
+    static CacheRegistry& instance() {
+        static CacheRegistry r;
+        return r;
+    }
+
+    // Cache size, from KLUJAX_FACTOR_CACHE, defaulting to 8 live handles.
+    static size_t capacity() {
+        const char* e = std::getenv("KLUJAX_FACTOR_CACHE");
+        if (e) {
+            char* end = nullptr;
+            long v = std::strtol(e, &end, 10);
+            if (end != e && v > 0) return static_cast<size_t>(v);
+        }
+        return 8;
+    }
+
+    // Strict mode turns a rebuild into an error, for finding lost handles.
+    static bool strict() {
+        const char* e = std::getenv("KLUJAX_STRICT_CACHE");
+        return e && e[0] != '\0' && std::strcmp(e, "0") != 0;
+    }
+
+    // caller holds mu. 0 and live ids are skipped so an id stays unique.
+    uint64_t fresh_id() {
+        uint64_t id;
+        do {
+            id = next_id.fetch_add(1);
+        } while (id == 0 || entries.count(id));
+        return id;
+    }
+    void touch(uint64_t id) {
+        lru.remove(id);
+        lru.push_front(id);
+    }
+    void evict() {
+        size_t cap = capacity();
+        while (entries.size() > cap && !lru.empty()) {
+            uint64_t victim = lru.back();
+            lru.pop_back();
+            entries.erase(victim);
+        }
+    }
+    // Register entry under id (0 mints a fresh one), evicting overflow.
+    uint64_t insert(std::shared_ptr<CacheEntry> e, uint64_t id = 0) {
+        std::lock_guard<std::mutex> lk(mu);
+        if (id == 0) id = fresh_id();
+        entries[id] = std::move(e);
+        touch(id);
+        evict();
+        return id;
+    }
+    std::shared_ptr<CacheEntry> lookup(uint64_t id) {
+        std::lock_guard<std::mutex> lk(mu);
+        auto it = entries.find(id);
+        if (it == entries.end()) return nullptr;
+        touch(id);
+        return it->second;
+    }
+    void erase(uint64_t id) {
+        std::lock_guard<std::mutex> lk(mu);
+        entries.erase(id);
+        lru.remove(id);
+    }
+};
+
+// Build a fresh symbolic analysis from a COO pattern. Returns null on failure.
+std::shared_ptr<SymbolicObj> build_symbolic(const int* _Ai, const int* _Aj, int n_nz, int n_col) {
+    auto _Bi = std::make_unique<int[]>(n_nz);
+    auto _Bp = std::make_unique<int[]>(n_col + 1);
+    auto _Bk = std::make_unique<int[]>(n_nz);
+    coo_to_csc_analyze(n_col, n_nz, _Ai, _Aj, _Bi.get(), _Bp.get(), _Bk.get());
+    klu_common Common;
+    klu_defaults(&Common);
+    klu_symbolic* S = klu_analyze(n_col, _Bp.get(), _Bi.get(), &Common);
+    if (!S) return nullptr;
+    auto obj = std::make_shared<SymbolicObj>();
+    obj->S = S;
+    obj->n_col = n_col;
+    return obj;
+}
+
+// Factor one left-hand side against a symbolic. Returns null on failure.
+template <typename T>
+klu_numeric* build_numeric(SymbolicObj& sym, const int* _Ai, const int* _Aj, int n_nz, const T* _Ax_i) {
+    int n_col = sym.n_col;
+    auto _Bi = std::make_unique<int[]>(n_nz);
+    auto _Bp = std::make_unique<int[]>(n_col + 1);
+    auto _Bk = std::make_unique<int[]>(n_nz);
+    auto _Bx = std::make_unique<T[]>(n_nz);
+    coo_to_csc_analyze(n_col, n_nz, _Ai, _Aj, _Bi.get(), _Bp.get(), _Bk.get());
+    for (int k = 0; k < n_nz; k++) _Bx[k] = _Ax_i[_Bk[k]];
+    klu_common Common;
+    klu_defaults(&Common);
+    klu_numeric* N = KluTraits<T>::factor(_Bp.get(), _Bi.get(), _Bx.get(), sym.S, &Common);
+    if (N == nullptr || Common.status < KLU_OK) {
+        if (N) klu_free_numeric(&N, &Common);
+        return nullptr;
+    }
+    return N;
+}
+
+// Resolve a symbolic id, rebuilding from the caller's pattern on a miss. The
+// heavy klu_analyze runs outside the registry lock. Sets `err` and returns null
+// only on strict-mode miss or an analyze failure.
+std::shared_ptr<SymbolicObj> resolve_symbolic(uint64_t id, const int* _Ai, const int* _Aj, int n_nz,
+                                              int n_col, ffi::Error& err) {
+    auto& r = CacheRegistry::instance();
+    if (auto e = r.lookup(id)) return e->symbolic;
+    if (CacheRegistry::strict()) {
+        err = ffi::Error::Internal("klujax: symbolic handle " + std::to_string(id) +
+                                   " was evicted or freed and strict cache mode is on");
+        return nullptr;
+    }
+    auto sym = build_symbolic(_Ai, _Aj, n_nz, n_col);
+    if (!sym) {
+        err = ffi::Error::Internal("klujax: rebuild of symbolic handle failed (klu_analyze)");
+        return nullptr;
+    }
+    r.rebuilds.fetch_add(1);
+    auto e = std::make_shared<CacheEntry>();
+    e->symbolic = sym;
+    r.insert(e, id);  // heal under the same id so later calls hit
+    return sym;
+}
+
+// Resolve one numeric id, rebuilding analysis and factorization from the
+// caller's matrix on a miss. Returns the whole entry so the solver can use its
+// self-consistent symbolic/numeric pair.
+template <typename T>
+std::shared_ptr<CacheEntry> resolve_numeric(uint64_t id, const int* _Ai, const int* _Aj, int n_nz,
+                                            int n_col, const T* _Ax_i, ffi::Error& err,
+                                            bool* rebuilt = nullptr) {
+    if (rebuilt) *rebuilt = false;
+    auto& r = CacheRegistry::instance();
+    if (auto e = r.lookup(id)) {
+        if (e->numeric) return e;
+    }
+    if (rebuilt) *rebuilt = true;
+    if (CacheRegistry::strict()) {
+        err = ffi::Error::Internal("klujax: numeric handle " + std::to_string(id) +
+                                   " was evicted or freed and strict cache mode is on");
+        return nullptr;
+    }
+    auto sym = build_symbolic(_Ai, _Aj, n_nz, n_col);
+    if (!sym) {
+        err = ffi::Error::Internal("klujax: rebuild of numeric handle failed (klu_analyze)");
+        return nullptr;
+    }
+    klu_numeric* N = build_numeric<T>(*sym, _Ai, _Aj, n_nz, _Ax_i);
+    if (!N) {
+        err = ffi::Error::Internal("klujax: rebuild of numeric handle failed (klu_factor)");
+        return nullptr;
+    }
+    auto e = std::make_shared<CacheEntry>();
+    e->symbolic = sym;
+    e->numeric = N;
+    r.rebuilds.fetch_add(1);
+    r.insert(e, id);
+    return e;
 }
 
 template <typename T>
@@ -426,9 +639,7 @@ ffi::Error solve_with_symbol_impl(
     const T* _b,
     T* _x) {
     if (symbolic.element_count() != 1) return ffi::Error::InvalidArgument("symbolic must be scalar");
-    uint64_t sym_addr = *symbolic.typed_data();
-    if (sym_addr == 0) return ffi::Error::InvalidArgument("symbolic pointer is null");
-    klu_symbolic* Symbolic = reinterpret_cast<klu_symbolic*>(sym_addr);
+    uint64_t sym_id = *symbolic.typed_data();
 
     ffi::Error err = validate_args(Ai, Aj, ds_Ax, ds_b);
     if (err.failure()) {
@@ -441,6 +652,11 @@ ffi::Error solve_with_symbol_impl(
     int n_nz = (int)ds_Ax[1];
     const int* _Ai = Ai.typed_data();
     const int* _Aj = Aj.typed_data();
+
+    // Resolve the analysis by id, rebuilding it from Ai/Aj if it was evicted.
+    auto _sym = resolve_symbolic(sym_id, _Ai, _Aj, n_nz, n_col, err);
+    if (!_sym) return err;
+    klu_symbolic* Symbolic = _sym->S;
 
     // get COO -> CSC transformation information (using RAII for automatic cleanup)
     auto _Bk = std::make_unique<int[]>(n_nz);  // Ax -> Bx transformation indices
@@ -564,9 +780,7 @@ ffi::Error tsolve_with_symbol_impl(
     const T* _b,
     T* _x) {
     if (symbolic.element_count() != 1) return ffi::Error::InvalidArgument("symbolic must be scalar");
-    uint64_t sym_addr = *symbolic.typed_data();
-    if (sym_addr == 0) return ffi::Error::InvalidArgument("symbolic pointer is null");
-    klu_symbolic* Symbolic = reinterpret_cast<klu_symbolic*>(sym_addr);
+    uint64_t sym_id = *symbolic.typed_data();
 
     ffi::Error err = validate_args(Ai, Aj, ds_Ax, ds_b);
     if (err.failure()) {
@@ -579,6 +793,11 @@ ffi::Error tsolve_with_symbol_impl(
     int n_nz = (int)ds_Ax[1];
     const int* _Ai = Ai.typed_data();
     const int* _Aj = Aj.typed_data();
+
+    // Resolve the analysis by id, rebuilding it from Ai/Aj if it was evicted.
+    auto _sym = resolve_symbolic(sym_id, _Ai, _Aj, n_nz, n_col, err);
+    if (!_sym) return err;
+    klu_symbolic* Symbolic = _sym->S;
 
     auto _Bk = std::make_unique<int[]>(n_nz);
     auto _Bi = std::make_unique<int[]>(n_nz);
@@ -688,6 +907,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
 
 template <typename T>
 ffi::Error factor_impl(
+    int64_t n_col_attr,
     const ffi::Buffer<ffi::DataType::S32>& Ai,
     const ffi::Buffer<ffi::DataType::S32>& Aj,
     const ffi::AnyBuffer::Dimensions& ds_Ax,
@@ -695,13 +915,11 @@ ffi::Error factor_impl(
     const T* _Ax,
     uint64_t* _numeric) {
     if (symbolic.element_count() != 1) return ffi::Error::InvalidArgument("symbolic must be scalar");
-    uint64_t sym_addr = *symbolic.typed_data();
-    if (sym_addr == 0) return ffi::Error::InvalidArgument("symbolic pointer is null");
-    klu_symbolic* Symbolic = reinterpret_cast<klu_symbolic*>(sym_addr);
+    uint64_t sym_id = *symbolic.typed_data();
 
     int n_lhs = (int)ds_Ax[0];
     int n_nz = (int)ds_Ax[1];
-    int n_col = Symbolic->n;
+    int n_col = (int)n_col_attr;
 
     if (Ai.dimensions().size() != 1 || Aj.dimensions().size() != 1) return ffi::Error::InvalidArgument("Ai/Aj must be 1D");
     if (Ai.dimensions()[0] != n_nz || Aj.dimensions()[0] != n_nz) return ffi::Error::InvalidArgument("Ai/Aj size mismatch with Ax");
@@ -709,56 +927,48 @@ ffi::Error factor_impl(
     const int* _Ai = Ai.typed_data();
     const int* _Aj = Aj.typed_data();
 
-    // get COO -> CSC transformation information
-    auto _Bk = std::make_unique<int[]>(n_nz);
-    auto _Bi = std::make_unique<int[]>(n_nz);
-    auto _Bp = std::make_unique<int[]>(n_col + 1);
-    auto _Bx = std::make_unique<T[]>(n_nz);
+    // Resolve the analysis (rebuilding it if it was evicted) and reuse it for
+    // every left-hand side. Each numeric shares that symbolic, so the split
+    // API keeps its "analyze once" benefit.
+    ffi::Error err = ffi::Error::Success();
+    auto sym = resolve_symbolic(sym_id, _Ai, _Aj, n_nz, n_col, err);
+    if (!sym) return err;
 
-    coo_to_csc_analyze(n_col, n_nz, _Ai, _Aj, _Bi.get(), _Bp.get(), _Bk.get());
-
-    klu_common Common;
-    klu_defaults(&Common);
-
+    auto& registry = CacheRegistry::instance();
     for (int i = 0; i < n_lhs; i++) {
-        int m = i * n_nz;
-        // convert COO Ax to CSC Bx
-        for (int k = 0; k < n_nz; k++) {
-            _Bx[k] = _Ax[m + _Bk[k]];
-        }
-
-        klu_numeric* Numeric = KluTraits<T>::factor(_Bp.get(), _Bi.get(), _Bx.get(), Symbolic, &Common);
-        if (Numeric == nullptr || Common.status < KLU_OK) {
-            // Cleanup already allocated numerics in this batch?
-            // For simplicity, we return error and let user handle cleanup (or leak, but this is exception path).
-            // Ideally we should cleanup.
-            for (int j = 0; j < i; j++) {
-                klu_numeric* num = reinterpret_cast<klu_numeric*>(_numeric[j]);
-                klu_free_numeric(&num, &Common);
-            }
+        const T* _Ax_i = _Ax + (size_t)i * n_nz;
+        klu_numeric* Numeric = build_numeric<T>(*sym, _Ai, _Aj, n_nz, _Ax_i);
+        if (Numeric == nullptr) {
             return ffi::Error::InvalidArgument("klu_factor/z_factor failed (singular matrix?)");
         }
-        _numeric[i] = reinterpret_cast<uint64_t>(Numeric);
+        // A fresh id names one immutable factorization: this is the data edge
+        // XLA orders solves against, and why no optimization_barrier is needed.
+        auto entry = std::make_shared<CacheEntry>();
+        entry->symbolic = sym;
+        entry->numeric = Numeric;
+        _numeric[i] = registry.insert(entry);
     }
     return ffi::Error::Success();
 }
 
 ffi::Error factor_f64(
+    int64_t n_col,
     const ffi::Buffer<ffi::DataType::S32> Ai,
     const ffi::Buffer<ffi::DataType::S32> Aj,
     const ffi::Buffer<ffi::DataType::F64> Ax,
     const ffi::Buffer<ffi::DataType::U64> symbolic,
     ffi::Result<ffi::Buffer<ffi::DataType::U64>> numeric) {
-    return factor_impl<double>(Ai, Aj, Ax.dimensions(), symbolic, Ax.typed_data(), numeric->typed_data());
+    return factor_impl<double>(n_col, Ai, Aj, Ax.dimensions(), symbolic, Ax.typed_data(), numeric->typed_data());
 }
 
 ffi::Error factor_c128(
+    int64_t n_col,
     const ffi::Buffer<ffi::DataType::S32> Ai,
     const ffi::Buffer<ffi::DataType::S32> Aj,
     const ffi::Buffer<ffi::DataType::C128> Ax,
     const ffi::Buffer<ffi::DataType::U64> symbolic,
     ffi::Result<ffi::Buffer<ffi::DataType::U64>> numeric) {
-    return factor_impl<Complex>(Ai, Aj, Ax.dimensions(), symbolic,
+    return factor_impl<Complex>(n_col, Ai, Aj, Ax.dimensions(), symbolic,
                                 reinterpret_cast<const Complex*>(Ax.typed_data()),
                                 numeric->typed_data());
 }
@@ -766,6 +976,7 @@ ffi::Error factor_c128(
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     factor_f64_handler, factor_f64,
     ffi::Ffi::Bind()
+        .Attr<int64_t>("n_col")
         .Arg<ffi::Buffer<ffi::DataType::S32>>()
         .Arg<ffi::Buffer<ffi::DataType::S32>>()
         .Arg<ffi::Buffer<ffi::DataType::F64>>()
@@ -775,6 +986,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     factor_c128_handler, factor_c128,
     ffi::Ffi::Bind()
+        .Attr<int64_t>("n_col")
         .Arg<ffi::Buffer<ffi::DataType::S32>>()
         .Arg<ffi::Buffer<ffi::DataType::S32>>()
         .Arg<ffi::Buffer<ffi::DataType::C128>>()
@@ -788,6 +1000,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
 // shape mismatch) stay FFI errors either way.
 template <typename T>
 ffi::Error refactor_impl(
+    int64_t n_col_attr,
     const ffi::Buffer<ffi::DataType::S32>& Ai,
     const ffi::Buffer<ffi::DataType::S32>& Aj,
     const ffi::AnyBuffer::Dimensions& ds_Ax,
@@ -796,14 +1009,11 @@ ffi::Error refactor_impl(
     const T* _Ax,
     uint64_t* _out_numeric,
     int32_t* _out_status = nullptr) {
-    if (symbolic.element_count() != 1) return ffi::Error::InvalidArgument("symbolic must be scalar");
-    uint64_t sym_addr = *symbolic.typed_data();
-    if (sym_addr == 0) return ffi::Error::InvalidArgument("symbolic pointer is null");
-    klu_symbolic* Symbolic = reinterpret_cast<klu_symbolic*>(sym_addr);
+    (void)symbolic;  // numeric handle is self-contained, uses its own analysis
 
     int n_lhs = (int)ds_Ax[0];
     int n_nz = (int)ds_Ax[1];
-    int n_col = Symbolic->n;
+    int n_col = (int)n_col_attr;
 
     if (Ai.dimensions().size() != 1 || Aj.dimensions().size() != 1) return ffi::Error::InvalidArgument("Ai/Aj must be 1D");
     if (Ai.dimensions()[0] != n_nz || Aj.dimensions()[0] != n_nz) return ffi::Error::InvalidArgument("Ai/Aj size mismatch with Ax");
@@ -813,7 +1023,7 @@ ffi::Error refactor_impl(
     const int* _Aj = Aj.typed_data();
     const uint64_t* _numeric = numeric.typed_data();
 
-    // get COO -> CSC transformation information
+    // Shared CSC pattern, used by the in-place refactor of resident entries.
     auto _Bk = std::make_unique<int[]>(n_nz);
     auto _Bi = std::make_unique<int[]>(n_nz);
     auto _Bp = std::make_unique<int[]>(n_col + 1);
@@ -825,53 +1035,55 @@ ffi::Error refactor_impl(
     klu_defaults(&Common);
 
     for (int i = 0; i < n_lhs; i++) {
-        uint64_t num_addr = _numeric[i];
-        if (num_addr == 0) return ffi::Error::InvalidArgument("numeric pointer is null");
-        klu_numeric* Numeric = reinterpret_cast<klu_numeric*>(num_addr);
+        const T* _Ax_i = _Ax + (size_t)i * n_nz;
+        ffi::Error err = ffi::Error::Success();
+        bool rebuilt = false;
+        auto entry = resolve_numeric<T>(_numeric[i], _Ai, _Aj, n_nz, n_col, _Ax_i, err, &rebuilt);
+        if (!entry) return err;
 
-        int m = i * n_nz;
-        // convert COO Ax to CSC Bx
-        for (int k = 0; k < n_nz; k++) {
-            _Bx[k] = _Ax[m + _Bk[k]];
+        // A rebuilt entry was just factored with these values, so it is already
+        // the refactored state. Only a resident entry needs the refactor.
+        if (!rebuilt) {
+            for (int k = 0; k < n_nz; k++) _Bx[k] = _Ax_i[_Bk[k]];
+            Common.status = KLU_OK;
+            int ok = KluTraits<T>::refactor(_Bp.get(), _Bi.get(), _Bx.get(),
+                                            entry->symbolic->S, entry->numeric, &Common);
+            if (!ok && Common.status == KLU_OK) {
+                Common.status = KLU_SINGULAR;
+            }
+            if ((!ok || Common.status < KLU_OK) && _out_status == nullptr) {
+                return ffi::Error::InvalidArgument("klu_refactor/z_refactor failed (singular matrix?)");
+            }
+            if (_out_status != nullptr) _out_status[i] = (int32_t)Common.status;
+        } else if (_out_status != nullptr) {
+            _out_status[i] = KLU_OK;
         }
-
-        // Reset so a previous element's failure is not reported again for this one.
-        Common.status = KLU_OK;
-        int ok = KluTraits<T>::refactor(_Bp.get(), _Bi.get(), _Bx.get(), Symbolic, Numeric, &Common);
-        if (!ok && Common.status == KLU_OK) {
-            // Should not happen, but never report success for a refactor that returned false.
-            Common.status = KLU_SINGULAR;
-        }
-        if ((!ok || Common.status < KLU_OK) && _out_status == nullptr) {
-            return ffi::Error::InvalidArgument("klu_refactor/z_refactor failed (singular matrix?)");
-        }
-        if (_out_status != nullptr) {
-            _out_status[i] = (int32_t)Common.status;
-        }
-        // Pass through the same pointer so XLA sees a data dependency: refactor → solve
-        _out_numeric[i] = num_addr;
+        // Same id back out, so XLA sees the data edge refactor -> solve.
+        _out_numeric[i] = _numeric[i];
     }
     return ffi::Error::Success();
 }
 
 ffi::Error refactor_f64(
+    int64_t n_col,
     const ffi::Buffer<ffi::DataType::S32> Ai,
     const ffi::Buffer<ffi::DataType::S32> Aj,
     const ffi::Buffer<ffi::DataType::F64> Ax,
     const ffi::Buffer<ffi::DataType::U64> symbolic,
     const ffi::Buffer<ffi::DataType::U64> numeric,
     ffi::Result<ffi::Buffer<ffi::DataType::U64>> out_numeric) {
-    return refactor_impl<double>(Ai, Aj, Ax.dimensions(), symbolic, numeric, Ax.typed_data(), out_numeric->typed_data());
+    return refactor_impl<double>(n_col, Ai, Aj, Ax.dimensions(), symbolic, numeric, Ax.typed_data(), out_numeric->typed_data());
 }
 
 ffi::Error refactor_c128(
+    int64_t n_col,
     const ffi::Buffer<ffi::DataType::S32> Ai,
     const ffi::Buffer<ffi::DataType::S32> Aj,
     const ffi::Buffer<ffi::DataType::C128> Ax,
     const ffi::Buffer<ffi::DataType::U64> symbolic,
     const ffi::Buffer<ffi::DataType::U64> numeric,
     ffi::Result<ffi::Buffer<ffi::DataType::U64>> out_numeric) {
-    return refactor_impl<Complex>(Ai, Aj, Ax.dimensions(), symbolic, numeric,
+    return refactor_impl<Complex>(n_col, Ai, Aj, Ax.dimensions(), symbolic, numeric,
                                   reinterpret_cast<const Complex*>(Ax.typed_data()),
                                   out_numeric->typed_data());
 }
@@ -879,6 +1091,7 @@ ffi::Error refactor_c128(
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     refactor_f64_handler, refactor_f64,
     ffi::Ffi::Bind()
+        .Attr<int64_t>("n_col")
         .Arg<ffi::Buffer<ffi::DataType::S32>>()  // Ai
         .Arg<ffi::Buffer<ffi::DataType::S32>>()  // Aj
         .Arg<ffi::Buffer<ffi::DataType::F64>>()  // Ax
@@ -890,6 +1103,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     refactor_c128_handler, refactor_c128,
     ffi::Ffi::Bind()
+        .Attr<int64_t>("n_col")
         .Arg<ffi::Buffer<ffi::DataType::S32>>()   // Ai
         .Arg<ffi::Buffer<ffi::DataType::S32>>()   // Aj
         .Arg<ffi::Buffer<ffi::DataType::C128>>()  // Ax
@@ -901,6 +1115,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
 // refactor_status: same as refactor, but reports the KLU status per batch element instead
 // of failing the call. See refactor_impl for the contract.
 ffi::Error refactor_status_f64(
+    int64_t n_col,
     const ffi::Buffer<ffi::DataType::S32> Ai,
     const ffi::Buffer<ffi::DataType::S32> Aj,
     const ffi::Buffer<ffi::DataType::F64> Ax,
@@ -908,11 +1123,12 @@ ffi::Error refactor_status_f64(
     const ffi::Buffer<ffi::DataType::U64> numeric,
     ffi::Result<ffi::Buffer<ffi::DataType::U64>> out_numeric,
     ffi::Result<ffi::Buffer<ffi::DataType::S32>> out_status) {
-    return refactor_impl<double>(Ai, Aj, Ax.dimensions(), symbolic, numeric, Ax.typed_data(),
+    return refactor_impl<double>(n_col, Ai, Aj, Ax.dimensions(), symbolic, numeric, Ax.typed_data(),
                                  out_numeric->typed_data(), out_status->typed_data());
 }
 
 ffi::Error refactor_status_c128(
+    int64_t n_col,
     const ffi::Buffer<ffi::DataType::S32> Ai,
     const ffi::Buffer<ffi::DataType::S32> Aj,
     const ffi::Buffer<ffi::DataType::C128> Ax,
@@ -920,7 +1136,7 @@ ffi::Error refactor_status_c128(
     const ffi::Buffer<ffi::DataType::U64> numeric,
     ffi::Result<ffi::Buffer<ffi::DataType::U64>> out_numeric,
     ffi::Result<ffi::Buffer<ffi::DataType::S32>> out_status) {
-    return refactor_impl<Complex>(Ai, Aj, Ax.dimensions(), symbolic, numeric,
+    return refactor_impl<Complex>(n_col, Ai, Aj, Ax.dimensions(), symbolic, numeric,
                                   reinterpret_cast<const Complex*>(Ax.typed_data()),
                                   out_numeric->typed_data(), out_status->typed_data());
 }
@@ -928,6 +1144,7 @@ ffi::Error refactor_status_c128(
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     refactor_status_f64_handler, refactor_status_f64,
     ffi::Ffi::Bind()
+        .Attr<int64_t>("n_col")
         .Arg<ffi::Buffer<ffi::DataType::S32>>()  // Ai
         .Arg<ffi::Buffer<ffi::DataType::S32>>()  // Aj
         .Arg<ffi::Buffer<ffi::DataType::F64>>()  // Ax
@@ -940,6 +1157,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     refactor_status_c128_handler, refactor_status_c128,
     ffi::Ffi::Bind()
+        .Attr<int64_t>("n_col")
         .Arg<ffi::Buffer<ffi::DataType::S32>>()   // Ai
         .Arg<ffi::Buffer<ffi::DataType::S32>>()   // Aj
         .Arg<ffi::Buffer<ffi::DataType::C128>>()  // Ax
@@ -966,22 +1184,20 @@ ffi::Error refactor_and_solve_impl(
     T* _x,
     uint64_t* _out_numeric,
     int32_t* _out_status = nullptr) {
-    if (symbolic.element_count() != 1) return ffi::Error::InvalidArgument("symbolic must be scalar");
-    uint64_t sym_addr = *symbolic.typed_data();
-    if (sym_addr == 0) return ffi::Error::InvalidArgument("symbolic pointer is null");
-    klu_symbolic* Symbolic = reinterpret_cast<klu_symbolic*>(sym_addr);
+    (void)symbolic;  // numeric handle is self-contained, uses its own analysis
 
     int n_lhs_ax = (int)ds_Ax[0];
     int n_nz = (int)ds_Ax[1];
-    int n_col = Symbolic->n;
 
     if (Ai.dimensions().size() != 1 || Aj.dimensions().size() != 1) return ffi::Error::InvalidArgument("Ai/Aj must be 1D");
     if (Ai.dimensions()[0] != n_nz || Aj.dimensions()[0] != n_nz) return ffi::Error::InvalidArgument("Ai/Aj size mismatch with Ax");
     if ((int)numeric.element_count() != n_lhs_ax) return ffi::Error::InvalidArgument("numeric array size must match n_lhs");
 
-    // Validate b dimensions: must be 3D (n_lhs, n_col, n_rhs)
+    // Validate b dimensions: must be 3D (n_lhs, n_col, n_rhs). n_col comes from
+    // here, so no separate handle is needed to rebuild an evicted numeric.
     if (ds_b.size() != 3) return ffi::Error::InvalidArgument("b must be 3D (n_lhs, n_col, n_rhs)");
     int n_lhs_b = (int)ds_b[0];
+    int n_col = (int)ds_b[1];
     int n_rhs = (int)ds_b[2];
 
     if (n_lhs_ax != n_lhs_b) return ffi::Error::InvalidArgument("n_lhs mismatch between Ax and b");
@@ -1013,39 +1229,34 @@ ffi::Error refactor_and_solve_impl(
     klu_defaults(&Common);
 
     for (int i = 0; i < n_lhs; i++) {
-        uint64_t num_addr = _numeric[i];
-        if (num_addr == 0) return ffi::Error::InvalidArgument("numeric pointer is null");
-        klu_numeric* Numeric = reinterpret_cast<klu_numeric*>(num_addr);
-
-        int m = i * n_nz;
+        const T* _Ax_i = _Ax + (size_t)i * n_nz;
         int n = i * n_rhs * n_col;
 
-        // Convert COO Ax to CSC Bx
-        for (int k = 0; k < n_nz; k++) {
-            _Bx[k] = _Ax[m + _Bk[k]];
-        }
+        ffi::Error err = ffi::Error::Success();
+        bool rebuilt = false;
+        auto entry = resolve_numeric<T>(_numeric[i], _Ai, _Aj, n_nz, n_col, _Ax_i, err, &rebuilt);
+        if (!entry) return err;
 
-        // Refactor in-place (reuses pivots from original factor call). A singular matrix (or
-        // otherwise failed refactor/solve) fills this batch element's output with NaN instead
-        // of aborting the whole call, mirroring how LAPACK-backed solvers behave. A failed
-        // klu_refactor does not invalidate `Numeric` for a future refactor attempt, so the
-        // handle is still passed through unchanged.
-        // Reset so a previous element's failure is not reported again for this one.
+        // A rebuilt entry is already factored with these values. A resident one
+        // is refactored in place, reusing its pivots. A singular result fills
+        // this element's output with NaN rather than aborting the whole call.
         Common.status = KLU_OK;
-        int ok = KluTraits<T>::refactor(_Bp.get(), _Bi.get(), _Bx.get(), Symbolic, Numeric, &Common);
-        if (!ok && Common.status == KLU_OK) {
-            Common.status = KLU_SINGULAR;
+        int ok = 1;
+        if (!rebuilt) {
+            for (int k = 0; k < n_nz; k++) _Bx[k] = _Ax_i[_Bk[k]];
+            ok = KluTraits<T>::refactor(_Bp.get(), _Bi.get(), _Bx.get(),
+                                        entry->symbolic->S, entry->numeric, &Common);
+            if (!ok && Common.status == KLU_OK) Common.status = KLU_SINGULAR;
         }
-        // Pass through the same numeric pointer for the XLA dependency edge, on every path.
-        _out_numeric[i] = num_addr;
+        // Same id back out on every path, for the XLA edge refactor -> solve.
+        _out_numeric[i] = _numeric[i];
         if (!ok || Common.status < KLU_OK) {
             fill_nan(&_x_temp[n], n_rhs * n_col);
             if (_out_status != nullptr) _out_status[i] = (int32_t)Common.status;
             continue;
         }
 
-        // Solve immediately using the freshly refactored numeric
-        KluTraits<T>::solve(Symbolic, Numeric, n_col, n_rhs, &_x_temp[n], &Common);
+        KluTraits<T>::solve(entry->symbolic->S, entry->numeric, n_col, n_rhs, &_x_temp[n], &Common);
         if (Common.status < KLU_OK) {
             fill_nan(&_x_temp[n], n_rhs * n_col);
         }
@@ -1188,51 +1399,75 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
 // rcond: reciprocal pivot growth estimate min|Uii| / max|Uii|, computed in O(n) from an
 // existing numeric factorization. Detects pivot degradation after a refactor without the
 // cost of a probe solve. A failed call means the factorization is singular, so 0 is written.
+// rcond reads only a factorization, but to stay safe when its handle was
+// evicted it now also takes Ai/Aj/Ax/n_col so a missing numeric can be rebuilt.
 template <typename T>
 ffi::Error rcond_impl(
+    int64_t n_col_attr,
+    const ffi::Buffer<ffi::DataType::S32>& Ai,
+    const ffi::Buffer<ffi::DataType::S32>& Aj,
+    const ffi::AnyBuffer::Dimensions& ds_Ax,
     const ffi::Buffer<ffi::DataType::U64>& symbolic,
     const ffi::Buffer<ffi::DataType::U64>& numeric,
+    const T* _Ax,
     double* _out_rcond) {
-    if (symbolic.element_count() != 1) return ffi::Error::InvalidArgument("symbolic must be scalar");
-    uint64_t sym_addr = *symbolic.typed_data();
-    if (sym_addr == 0) return ffi::Error::InvalidArgument("symbolic pointer is null");
-    klu_symbolic* Symbolic = reinterpret_cast<klu_symbolic*>(sym_addr);
+    (void)symbolic;  // numeric handle is self-contained, uses its own analysis
 
     int n_lhs = (int)numeric.element_count();
+    int n_nz = (int)ds_Ax[1];
+    int n_col = (int)n_col_attr;
+    const int* _Ai = Ai.typed_data();
+    const int* _Aj = Aj.typed_data();
     const uint64_t* _numeric = numeric.typed_data();
 
     klu_common Common;
     klu_defaults(&Common);
 
     for (int i = 0; i < n_lhs; i++) {
-        uint64_t num_addr = _numeric[i];
-        if (num_addr == 0) return ffi::Error::InvalidArgument("numeric pointer is null");
-        klu_numeric* Numeric = reinterpret_cast<klu_numeric*>(num_addr);
+        const T* _Ax_i = _Ax + (size_t)i * n_nz;
+        ffi::Error err = ffi::Error::Success();
+        auto entry = resolve_numeric<T>(_numeric[i], _Ai, _Aj, n_nz, n_col, _Ax_i, err);
+        if (!entry) return err;
 
         Common.status = KLU_OK;
-        int ok = KluTraits<T>::rcond(Symbolic, Numeric, &Common);
+        int ok = KluTraits<T>::rcond(entry->symbolic->S, entry->numeric, &Common);
         _out_rcond[i] = (!ok || Common.status < KLU_OK) ? 0.0 : Common.rcond;
     }
     return ffi::Error::Success();
 }
 
 ffi::Error rcond_f64(
+    int64_t n_col,
+    const ffi::Buffer<ffi::DataType::S32> Ai,
+    const ffi::Buffer<ffi::DataType::S32> Aj,
+    const ffi::Buffer<ffi::DataType::F64> Ax,
     const ffi::Buffer<ffi::DataType::U64> symbolic,
     const ffi::Buffer<ffi::DataType::U64> numeric,
     ffi::Result<ffi::Buffer<ffi::DataType::F64>> out_rcond) {
-    return rcond_impl<double>(symbolic, numeric, out_rcond->typed_data());
+    return rcond_impl<double>(n_col, Ai, Aj, Ax.dimensions(), symbolic, numeric, Ax.typed_data(),
+                              out_rcond->typed_data());
 }
 
 ffi::Error rcond_c128(
+    int64_t n_col,
+    const ffi::Buffer<ffi::DataType::S32> Ai,
+    const ffi::Buffer<ffi::DataType::S32> Aj,
+    const ffi::Buffer<ffi::DataType::C128> Ax,
     const ffi::Buffer<ffi::DataType::U64> symbolic,
     const ffi::Buffer<ffi::DataType::U64> numeric,
     ffi::Result<ffi::Buffer<ffi::DataType::F64>> out_rcond) {
-    return rcond_impl<Complex>(symbolic, numeric, out_rcond->typed_data());
+    return rcond_impl<Complex>(n_col, Ai, Aj, Ax.dimensions(), symbolic, numeric,
+                               reinterpret_cast<const Complex*>(Ax.typed_data()),
+                               out_rcond->typed_data());
 }
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     rcond_f64_handler, rcond_f64,
     ffi::Ffi::Bind()
+        .Attr<int64_t>("n_col")
+        .Arg<ffi::Buffer<ffi::DataType::S32>>()  // Ai
+        .Arg<ffi::Buffer<ffi::DataType::S32>>()  // Aj
+        .Arg<ffi::Buffer<ffi::DataType::F64>>()  // Ax
         .Arg<ffi::Buffer<ffi::DataType::U64>>()  // symbolic
         .Arg<ffi::Buffer<ffi::DataType::U64>>()  // numeric
         .Ret<ffi::Buffer<ffi::DataType::F64>>()  // rcond per batch element
@@ -1241,9 +1476,13 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     rcond_c128_handler, rcond_c128,
     ffi::Ffi::Bind()
-        .Arg<ffi::Buffer<ffi::DataType::U64>>()  // symbolic
-        .Arg<ffi::Buffer<ffi::DataType::U64>>()  // numeric
-        .Ret<ffi::Buffer<ffi::DataType::F64>>()  // rcond per batch element
+        .Attr<int64_t>("n_col")
+        .Arg<ffi::Buffer<ffi::DataType::S32>>()   // Ai
+        .Arg<ffi::Buffer<ffi::DataType::S32>>()   // Aj
+        .Arg<ffi::Buffer<ffi::DataType::C128>>()  // Ax
+        .Arg<ffi::Buffer<ffi::DataType::U64>>()   // symbolic
+        .Arg<ffi::Buffer<ffi::DataType::U64>>()   // numeric
+        .Ret<ffi::Buffer<ffi::DataType::F64>>()   // rcond per batch element
 );
 
 // condest: 1-norm condition number estimate (Hager/Higham, as in MATLAB's condest). Needs
@@ -1251,6 +1490,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
 // borderline. A failed call means the factorization is singular, so infinity is written.
 template <typename T>
 ffi::Error condest_impl(
+    int64_t n_col_attr,
     const ffi::Buffer<ffi::DataType::S32>& Ai,
     const ffi::Buffer<ffi::DataType::S32>& Aj,
     const ffi::AnyBuffer::Dimensions& ds_Ax,
@@ -1258,14 +1498,11 @@ ffi::Error condest_impl(
     const ffi::Buffer<ffi::DataType::U64>& numeric,
     const T* _Ax,
     double* _out_condest) {
-    if (symbolic.element_count() != 1) return ffi::Error::InvalidArgument("symbolic must be scalar");
-    uint64_t sym_addr = *symbolic.typed_data();
-    if (sym_addr == 0) return ffi::Error::InvalidArgument("symbolic pointer is null");
-    klu_symbolic* Symbolic = reinterpret_cast<klu_symbolic*>(sym_addr);
+    (void)symbolic;  // numeric handle is self-contained, uses its own analysis
 
     int n_lhs = (int)ds_Ax[0];
     int n_nz = (int)ds_Ax[1];
-    int n_col = Symbolic->n;
+    int n_col = (int)n_col_attr;
 
     if (Ai.dimensions().size() != 1 || Aj.dimensions().size() != 1) return ffi::Error::InvalidArgument("Ai/Aj must be 1D");
     if (Ai.dimensions()[0] != n_nz || Aj.dimensions()[0] != n_nz) return ffi::Error::InvalidArgument("Ai/Aj size mismatch with Ax");
@@ -1275,7 +1512,7 @@ ffi::Error condest_impl(
     const int* _Aj = Aj.typed_data();
     const uint64_t* _numeric = numeric.typed_data();
 
-    // get COO -> CSC transformation information
+    // Shared CSC pattern and values scratch for the condest call itself.
     auto _Bk = std::make_unique<int[]>(n_nz);
     auto _Bi = std::make_unique<int[]>(n_nz);
     auto _Bp = std::make_unique<int[]>(n_col + 1);
@@ -1287,18 +1524,15 @@ ffi::Error condest_impl(
     klu_defaults(&Common);
 
     for (int i = 0; i < n_lhs; i++) {
-        uint64_t num_addr = _numeric[i];
-        if (num_addr == 0) return ffi::Error::InvalidArgument("numeric pointer is null");
-        klu_numeric* Numeric = reinterpret_cast<klu_numeric*>(num_addr);
+        const T* _Ax_i = _Ax + (size_t)i * n_nz;
+        ffi::Error err = ffi::Error::Success();
+        auto entry = resolve_numeric<T>(_numeric[i], _Ai, _Aj, n_nz, n_col, _Ax_i, err);
+        if (!entry) return err;
 
-        int m = i * n_nz;
-        // convert COO Ax to CSC Bx
-        for (int k = 0; k < n_nz; k++) {
-            _Bx[k] = _Ax[m + _Bk[k]];
-        }
+        for (int k = 0; k < n_nz; k++) _Bx[k] = _Ax_i[_Bk[k]];
 
         Common.status = KLU_OK;
-        int ok = KluTraits<T>::condest(_Bp.get(), _Bx.get(), Symbolic, Numeric, &Common);
+        int ok = KluTraits<T>::condest(_Bp.get(), _Bx.get(), entry->symbolic->S, entry->numeric, &Common);
         _out_condest[i] = (!ok || Common.status < KLU_OK)
                               ? std::numeric_limits<double>::infinity()
                               : Common.condest;
@@ -1307,24 +1541,26 @@ ffi::Error condest_impl(
 }
 
 ffi::Error condest_f64(
+    int64_t n_col,
     const ffi::Buffer<ffi::DataType::S32> Ai,
     const ffi::Buffer<ffi::DataType::S32> Aj,
     const ffi::Buffer<ffi::DataType::F64> Ax,
     const ffi::Buffer<ffi::DataType::U64> symbolic,
     const ffi::Buffer<ffi::DataType::U64> numeric,
     ffi::Result<ffi::Buffer<ffi::DataType::F64>> out_condest) {
-    return condest_impl<double>(Ai, Aj, Ax.dimensions(), symbolic, numeric, Ax.typed_data(),
+    return condest_impl<double>(n_col, Ai, Aj, Ax.dimensions(), symbolic, numeric, Ax.typed_data(),
                                 out_condest->typed_data());
 }
 
 ffi::Error condest_c128(
+    int64_t n_col,
     const ffi::Buffer<ffi::DataType::S32> Ai,
     const ffi::Buffer<ffi::DataType::S32> Aj,
     const ffi::Buffer<ffi::DataType::C128> Ax,
     const ffi::Buffer<ffi::DataType::U64> symbolic,
     const ffi::Buffer<ffi::DataType::U64> numeric,
     ffi::Result<ffi::Buffer<ffi::DataType::F64>> out_condest) {
-    return condest_impl<Complex>(Ai, Aj, Ax.dimensions(), symbolic, numeric,
+    return condest_impl<Complex>(n_col, Ai, Aj, Ax.dimensions(), symbolic, numeric,
                                  reinterpret_cast<const Complex*>(Ax.typed_data()),
                                  out_condest->typed_data());
 }
@@ -1332,6 +1568,7 @@ ffi::Error condest_c128(
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     condest_f64_handler, condest_f64,
     ffi::Ffi::Bind()
+        .Attr<int64_t>("n_col")
         .Arg<ffi::Buffer<ffi::DataType::S32>>()  // Ai
         .Arg<ffi::Buffer<ffi::DataType::S32>>()  // Aj
         .Arg<ffi::Buffer<ffi::DataType::F64>>()  // Ax
@@ -1343,6 +1580,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     condest_c128_handler, condest_c128,
     ffi::Ffi::Bind()
+        .Attr<int64_t>("n_col")
         .Arg<ffi::Buffer<ffi::DataType::S32>>()   // Ai
         .Arg<ffi::Buffer<ffi::DataType::S32>>()   // Aj
         .Arg<ffi::Buffer<ffi::DataType::C128>>()  // Ax
@@ -1353,19 +1591,27 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
 
 template <typename T>
 ffi::Error solve_with_numeric_impl(
+    const ffi::Buffer<ffi::DataType::S32>& Ai,
+    const ffi::Buffer<ffi::DataType::S32>& Aj,
+    const ffi::AnyBuffer::Dimensions& ds_Ax,
     const ffi::AnyBuffer::Dimensions& ds_b,
     const ffi::AnyBuffer::Dimensions& ds_x,
     const ffi::Buffer<ffi::DataType::U64>& symbolic,
     const ffi::Buffer<ffi::DataType::U64>& numeric,
+    const T* _Ax,
     const T* _b,
     T* _x) {
-    if (symbolic.element_count() != 1) return ffi::Error::InvalidArgument("symbolic must be scalar");
-    uint64_t sym_addr = *symbolic.typed_data();
-    if (sym_addr == 0) return ffi::Error::InvalidArgument("symbolic pointer is null");
-    klu_symbolic* Symbolic = reinterpret_cast<klu_symbolic*>(sym_addr);
+    (void)symbolic;  // numeric handle is self-contained, uses its own analysis
 
     int n_numeric = numeric.element_count();
     const uint64_t* _numeric = numeric.typed_data();
+    const int* _Ai = Ai.typed_data();
+    const int* _Aj = Aj.typed_data();
+    // Ax carries, by contract, the values that produced these factorizations,
+    // so an evicted numeric can be rebuilt from it. It is (n_nz,) when the
+    // numeric is a single (broadcast) handle, else (n_numeric, n_nz).
+    int n_nz = (int)((ds_Ax.size() == 1) ? ds_Ax[0] : ds_Ax[1]);
+    int n_ax = (int)((ds_Ax.size() == 1) ? 1 : ds_Ax[0]);
 
     // Parse b dimensions
     int d_b = ds_b.size();
@@ -1439,13 +1685,17 @@ ffi::Error solve_with_numeric_impl(
 
     for (int i = 0; i < n_lhs; i++) {
         int n = i * n_rhs * n_col;
-        uint64_t num_addr = broadcast_numeric ? _numeric[0] : _numeric[i];
-        if (num_addr == 0) return ffi::Error::InvalidArgument("numeric pointer is null");
+        int num_i = broadcast_numeric ? 0 : i;
+        int ax_i = (n_ax == 1) ? 0 : num_i;
+        const T* _Ax_i = _Ax + (size_t)ax_i * n_nz;
 
-        klu_numeric* Numeric = reinterpret_cast<klu_numeric*>(num_addr);
-        KluTraits<T>::solve(Symbolic, Numeric, n_col, n_rhs, &_x_temp[n], &Common);
+        ffi::Error err = ffi::Error::Success();
+        auto entry = resolve_numeric<T>(_numeric[num_i], _Ai, _Aj, n_nz, n_col, _Ax_i, err);
+        if (!entry) return err;
 
-        // A failed solve fills this batch element's output with NaN instead of aborting the
+        KluTraits<T>::solve(entry->symbolic->S, entry->numeric, n_col, n_rhs, &_x_temp[n], &Common);
+
+        // A failed solve fills this element's output with NaN instead of aborting the
         // whole call, mirroring how LAPACK-backed solvers behave on a singular system.
         if (Common.status < KLU_OK) {
             fill_nan(&_x_temp[n], n_rhs * n_col);
@@ -1464,19 +1714,29 @@ ffi::Error solve_with_numeric_impl(
 }
 
 ffi::Error solve_with_numeric_f64(
+    const ffi::Buffer<ffi::DataType::S32> Ai,
+    const ffi::Buffer<ffi::DataType::S32> Aj,
+    const ffi::Buffer<ffi::DataType::F64> Ax,
     const ffi::Buffer<ffi::DataType::U64> symbolic,
     const ffi::Buffer<ffi::DataType::U64> numeric,
     const ffi::Buffer<ffi::DataType::F64> b,
     ffi::Result<ffi::Buffer<ffi::DataType::F64>> x) {
-    return solve_with_numeric_impl<double>(b.dimensions(), x->dimensions(), symbolic, numeric, b.typed_data(), x->typed_data());
+    return solve_with_numeric_impl<double>(Ai, Aj, Ax.dimensions(), b.dimensions(), x->dimensions(),
+                                           symbolic, numeric, Ax.typed_data(), b.typed_data(),
+                                           x->typed_data());
 }
 
 ffi::Error solve_with_numeric_c128(
+    const ffi::Buffer<ffi::DataType::S32> Ai,
+    const ffi::Buffer<ffi::DataType::S32> Aj,
+    const ffi::Buffer<ffi::DataType::C128> Ax,
     const ffi::Buffer<ffi::DataType::U64> symbolic,
     const ffi::Buffer<ffi::DataType::U64> numeric,
     const ffi::Buffer<ffi::DataType::C128> b,
     ffi::Result<ffi::Buffer<ffi::DataType::C128>> x) {
-    return solve_with_numeric_impl<Complex>(b.dimensions(), x->dimensions(), symbolic, numeric,
+    return solve_with_numeric_impl<Complex>(Ai, Aj, Ax.dimensions(), b.dimensions(), x->dimensions(),
+                                            symbolic, numeric,
+                                            reinterpret_cast<const Complex*>(Ax.typed_data()),
                                             reinterpret_cast<const Complex*>(b.typed_data()),
                                             reinterpret_cast<Complex*>(x->typed_data()));
 }
@@ -1484,36 +1744,50 @@ ffi::Error solve_with_numeric_c128(
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     solve_with_numeric_f64_handler, solve_with_numeric_f64,
     ffi::Ffi::Bind()
-        .Arg<ffi::Buffer<ffi::DataType::U64>>()
-        .Arg<ffi::Buffer<ffi::DataType::U64>>()
-        .Arg<ffi::Buffer<ffi::DataType::F64>>()
+        .Arg<ffi::Buffer<ffi::DataType::S32>>()  // Ai
+        .Arg<ffi::Buffer<ffi::DataType::S32>>()  // Aj
+        .Arg<ffi::Buffer<ffi::DataType::F64>>()  // Ax
+        .Arg<ffi::Buffer<ffi::DataType::U64>>()  // symbolic
+        .Arg<ffi::Buffer<ffi::DataType::U64>>()  // numeric
+        .Arg<ffi::Buffer<ffi::DataType::F64>>()  // b
         .Ret<ffi::Buffer<ffi::DataType::F64>>());
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     solve_with_numeric_c128_handler, solve_with_numeric_c128,
     ffi::Ffi::Bind()
-        .Arg<ffi::Buffer<ffi::DataType::U64>>()
-        .Arg<ffi::Buffer<ffi::DataType::U64>>()
-        .Arg<ffi::Buffer<ffi::DataType::C128>>()
+        .Arg<ffi::Buffer<ffi::DataType::S32>>()   // Ai
+        .Arg<ffi::Buffer<ffi::DataType::S32>>()   // Aj
+        .Arg<ffi::Buffer<ffi::DataType::C128>>()  // Ax
+        .Arg<ffi::Buffer<ffi::DataType::U64>>()   // symbolic
+        .Arg<ffi::Buffer<ffi::DataType::U64>>()   // numeric
+        .Arg<ffi::Buffer<ffi::DataType::C128>>()  // b
         .Ret<ffi::Buffer<ffi::DataType::C128>>());
 
 // tsolve_with_numeric: identical to solve_with_numeric_impl but uses KluTraits<T>::tsolve.
 // Solves A^T x = b using a pre-computed numeric factorization.
 template <typename T>
 ffi::Error tsolve_with_numeric_impl(
+    const ffi::Buffer<ffi::DataType::S32>& Ai,
+    const ffi::Buffer<ffi::DataType::S32>& Aj,
+    const ffi::AnyBuffer::Dimensions& ds_Ax,
     const ffi::AnyBuffer::Dimensions& ds_b,
     const ffi::AnyBuffer::Dimensions& ds_x,
     const ffi::Buffer<ffi::DataType::U64>& symbolic,
     const ffi::Buffer<ffi::DataType::U64>& numeric,
+    const T* _Ax,
     const T* _b,
     T* _x) {
-    if (symbolic.element_count() != 1) return ffi::Error::InvalidArgument("symbolic must be scalar");
-    uint64_t sym_addr = *symbolic.typed_data();
-    if (sym_addr == 0) return ffi::Error::InvalidArgument("symbolic pointer is null");
-    klu_symbolic* Symbolic = reinterpret_cast<klu_symbolic*>(sym_addr);
+    (void)symbolic;  // numeric handle is self-contained, uses its own analysis
 
     int n_numeric = numeric.element_count();
     const uint64_t* _numeric = numeric.typed_data();
+    const int* _Ai = Ai.typed_data();
+    const int* _Aj = Aj.typed_data();
+    // Ax carries, by contract, the values that produced these factorizations,
+    // so an evicted numeric can be rebuilt from it. It is (n_nz,) when the
+    // numeric is a single (broadcast) handle, else (n_numeric, n_nz).
+    int n_nz = (int)((ds_Ax.size() == 1) ? ds_Ax[0] : ds_Ax[1]);
+    int n_ax = (int)((ds_Ax.size() == 1) ? 1 : ds_Ax[0]);
 
     int d_b = ds_b.size();
     int n_lhs_b, n_col, n_rhs;
@@ -1573,14 +1847,18 @@ ffi::Error tsolve_with_numeric_impl(
 
     for (int i = 0; i < n_lhs; i++) {
         int n = i * n_rhs * n_col;
-        uint64_t num_addr = broadcast_numeric ? _numeric[0] : _numeric[i];
-        if (num_addr == 0) return ffi::Error::InvalidArgument("numeric pointer is null");
+        int num_i = broadcast_numeric ? 0 : i;
+        int ax_i = (n_ax == 1) ? 0 : num_i;
+        const T* _Ax_i = _Ax + (size_t)ax_i * n_nz;
 
-        klu_numeric* Numeric = reinterpret_cast<klu_numeric*>(num_addr);
+        ffi::Error err = ffi::Error::Success();
+        auto entry = resolve_numeric<T>(_numeric[num_i], _Ai, _Aj, n_nz, n_col, _Ax_i, err);
+        if (!entry) return err;
+
         // NOTE: tsolve instead of solve
-        KluTraits<T>::tsolve(Symbolic, Numeric, n_col, n_rhs, &_x_temp[n], &Common);
+        KluTraits<T>::tsolve(entry->symbolic->S, entry->numeric, n_col, n_rhs, &_x_temp[n], &Common);
 
-        // A failed solve fills this batch element's output with NaN instead of aborting the
+        // A failed solve fills this element's output with NaN instead of aborting the
         // whole call, mirroring how LAPACK-backed solvers behave on a singular system.
         if (Common.status < KLU_OK) {
             fill_nan(&_x_temp[n], n_rhs * n_col);
@@ -1598,19 +1876,29 @@ ffi::Error tsolve_with_numeric_impl(
 }
 
 ffi::Error tsolve_with_numeric_f64(
+    const ffi::Buffer<ffi::DataType::S32> Ai,
+    const ffi::Buffer<ffi::DataType::S32> Aj,
+    const ffi::Buffer<ffi::DataType::F64> Ax,
     const ffi::Buffer<ffi::DataType::U64> symbolic,
     const ffi::Buffer<ffi::DataType::U64> numeric,
     const ffi::Buffer<ffi::DataType::F64> b,
     ffi::Result<ffi::Buffer<ffi::DataType::F64>> x) {
-    return tsolve_with_numeric_impl<double>(b.dimensions(), x->dimensions(), symbolic, numeric, b.typed_data(), x->typed_data());
+    return tsolve_with_numeric_impl<double>(Ai, Aj, Ax.dimensions(), b.dimensions(), x->dimensions(),
+                                            symbolic, numeric, Ax.typed_data(), b.typed_data(),
+                                            x->typed_data());
 }
 
 ffi::Error tsolve_with_numeric_c128(
+    const ffi::Buffer<ffi::DataType::S32> Ai,
+    const ffi::Buffer<ffi::DataType::S32> Aj,
+    const ffi::Buffer<ffi::DataType::C128> Ax,
     const ffi::Buffer<ffi::DataType::U64> symbolic,
     const ffi::Buffer<ffi::DataType::U64> numeric,
     const ffi::Buffer<ffi::DataType::C128> b,
     ffi::Result<ffi::Buffer<ffi::DataType::C128>> x) {
-    return tsolve_with_numeric_impl<Complex>(b.dimensions(), x->dimensions(), symbolic, numeric,
+    return tsolve_with_numeric_impl<Complex>(Ai, Aj, Ax.dimensions(), b.dimensions(), x->dimensions(),
+                                             symbolic, numeric,
+                                             reinterpret_cast<const Complex*>(Ax.typed_data()),
                                              reinterpret_cast<const Complex*>(b.typed_data()),
                                              reinterpret_cast<Complex*>(x->typed_data()));
 }
@@ -1618,6 +1906,9 @@ ffi::Error tsolve_with_numeric_c128(
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     tsolve_with_numeric_f64_handler, tsolve_with_numeric_f64,
     ffi::Ffi::Bind()
+        .Arg<ffi::Buffer<ffi::DataType::S32>>()  // Ai
+        .Arg<ffi::Buffer<ffi::DataType::S32>>()  // Aj
+        .Arg<ffi::Buffer<ffi::DataType::F64>>()  // Ax
         .Arg<ffi::Buffer<ffi::DataType::U64>>()  // symbolic
         .Arg<ffi::Buffer<ffi::DataType::U64>>()  // numeric
         .Arg<ffi::Buffer<ffi::DataType::F64>>()  // b
@@ -1627,29 +1918,31 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     tsolve_with_numeric_c128_handler, tsolve_with_numeric_c128,
     ffi::Ffi::Bind()
+        .Arg<ffi::Buffer<ffi::DataType::S32>>()   // Ai
+        .Arg<ffi::Buffer<ffi::DataType::S32>>()   // Aj
+        .Arg<ffi::Buffer<ffi::DataType::C128>>()  // Ax
         .Arg<ffi::Buffer<ffi::DataType::U64>>()   // symbolic
         .Arg<ffi::Buffer<ffi::DataType::U64>>()   // numeric
         .Arg<ffi::Buffer<ffi::DataType::C128>>()  // b
         .Ret<ffi::Buffer<ffi::DataType::C128>>()  // x
 );
 
+// Freeing now just drops the cache entry, which frees its KLU objects. It is
+// never required: a later use of the id rebuilds it. An unknown id is a no-op.
+// ordering is an unused operand that only gives XLA a data dependency, so a
+// free inside a jit trace runs after the solves it must follow. See free_numeric
+// in klujax.py.
 ffi::Error free_numeric(
     const ffi::Buffer<ffi::DataType::U64> numeric,
+    const ffi::Buffer<ffi::DataType::S32> ordering,
     ffi::Result<ffi::Buffer<ffi::DataType::S32>> status) {
+    (void)ordering;
     int n = numeric.element_count();
     const uint64_t* _numeric = numeric.typed_data();
-
-    klu_common Common;
-    klu_defaults(&Common);
-
+    auto& r = CacheRegistry::instance();
     for (int i = 0; i < n; i++) {
-        uint64_t addr = _numeric[i];
-        if (addr != 0) {
-            klu_numeric* Numeric = reinterpret_cast<klu_numeric*>(addr);
-            klu_free_numeric(&Numeric, &Common);
-        }
+        if (_numeric[i] != 0) r.erase(_numeric[i]);
     }
-
     // returning value so function can be traced
     *status->typed_data() = 1;
     return ffi::Error::Success();
@@ -1657,21 +1950,18 @@ ffi::Error free_numeric(
 
 ffi::Error free_symbolic(
     const ffi::Buffer<ffi::DataType::U64> symbolic,
+    const ffi::Buffer<ffi::DataType::S32> ordering,
     ffi::Result<ffi::Buffer<ffi::DataType::S32>> status) {
+    (void)ordering;
     if (symbolic.element_count() != 1) {
         return ffi::Error::InvalidArgument("symbolic must be a scalar.");
     }
-    uint64_t sym_addr = *symbolic.typed_data();
-    if (sym_addr == 0) {
+    uint64_t sym_id = *symbolic.typed_data();
+    if (sym_id == 0) {
         *status->typed_data() = 0;  // 0 = nothing to free
         return ffi::Error::Success();
     }
-
-    klu_symbolic* Symbolic = reinterpret_cast<klu_symbolic*>(sym_addr);
-    klu_common Common;
-    klu_defaults(&Common);
-    klu_free_symbolic(&Symbolic, &Common);
-
+    CacheRegistry::instance().erase(sym_id);
     // returning value so function can be traced
     *status->typed_data() = 1;
     return ffi::Error::Success();
@@ -1681,6 +1971,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
     free_numeric_handler, free_numeric,
     ffi::Ffi::Bind()
         .Arg<ffi::Buffer<ffi::DataType::U64>>()  // numeric
+        .Arg<ffi::Buffer<ffi::DataType::S32>>()  // ordering (unused)
         .Ret<ffi::Buffer<ffi::DataType::S32>>()  // status (instead of no return)
 );
 
@@ -1688,6 +1979,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
     free_symbolic_handler, free_symbolic,
     ffi::Ffi::Bind()
         .Arg<ffi::Buffer<ffi::DataType::U64>>()  // symbolic
+        .Arg<ffi::Buffer<ffi::DataType::S32>>()  // ordering (unused)
         .Ret<ffi::Buffer<ffi::DataType::S32>>()  // status
 );
 
@@ -1718,21 +2010,15 @@ ffi::Error analyze(
         if (_Aj[n] < 0 || _Aj[n] >= n_col) return ffi::Error::InvalidArgument("Aj index out of bounds.");
     }
 
-    auto _Bi = std::make_unique<int[]>(n_nz);
-    auto _Bp = std::make_unique<int[]>(n_col + 1);
-    auto _Bk = std::make_unique<int[]>(n_nz);
-
-    coo_to_csc_analyze(n_col, n_nz, _Ai, _Aj, _Bi.get(), _Bp.get(), _Bk.get());
-
-    klu_common Common;
-    klu_defaults(&Common);
-    klu_symbolic* Symbolic = klu_analyze(n_col, _Bp.get(), _Bi.get(), &Common);
-
-    if (!Symbolic) {
+    // Build the analysis and register it. The returned id, not a pointer, is
+    // the handle: a stale id is a safe cache miss, never a bad dereference.
+    auto sym = build_symbolic(_Ai, _Aj, n_nz, n_col);
+    if (!sym) {
         return ffi::Error::Internal("klu_analyze failed.");
     }
-
-    *symbolic->typed_data() = reinterpret_cast<uint64_t>(Symbolic);
+    auto entry = std::make_shared<CacheEntry>();
+    entry->symbolic = sym;
+    *symbolic->typed_data() = CacheRegistry::instance().insert(entry);
     return ffi::Error::Success();
 }
 
@@ -1805,4 +2091,10 @@ PYBIND11_MODULE(klujax_cpp, m) {
           []() { return py::capsule((void*)&condest_f64_handler); });
     m.def("condest_c128",
           []() { return py::capsule((void*)&condest_c128_handler); });
+    // Diagnostics for the handle cache: how many factorizations had to be
+    // rebuilt because their handle was evicted or freed, and a reset.
+    m.def("rebuild_count",
+          []() { return (long)CacheRegistry::instance().rebuilds.load(); });
+    m.def("reset_rebuild_count",
+          []() { CacheRegistry::instance().rebuilds.store(0); });
 }

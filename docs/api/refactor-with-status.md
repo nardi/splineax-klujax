@@ -6,8 +6,8 @@ summary: Re-do LU factorization and report failure as a status code
 # refactor_with_status
 
 ```python
-klujax.refactor_with_status(Ai, Aj, Ax, numeric, symbolic) -> tuple[KLUHandleManager, Array]
-klujax.refactor_and_solve_with_status(Ai, Aj, Ax, b, numeric, symbolic) -> tuple[Array, KLUHandleManager, Array]
+klujax.refactor_with_status(Ai, Aj, Ax, numeric, symbolic) -> tuple[NumericToken, Array]
+klujax.refactor_and_solve_with_status(Ai, Aj, Ax, b, numeric, symbolic) -> tuple[Array, NumericToken, Array]
 ```
 
 Same work as [refactor](refactor.md), but a failed refactorization is reported through a status code instead of raised as an error. Use it when the caller wants to fall back to a fresh [factor](factor.md) rather than lose the whole computation.
@@ -34,7 +34,9 @@ Same work as [refactor](refactor.md), but a failed refactorization is reported t
 
 ## Returns
 
-`refactor_with_status` returns `(numeric, status)`. The numeric handle is the same pointer as the input, wrapped with `owner=False` exactly as [refactor](refactor.md) does, so the original owner still frees it. `status` is `int32` of shape `(n_lhs,)`.
+`refactor_with_status` returns `(numeric, status)`. The returned `NumericToken` carries the
+same cache id as the input, refactored in place exactly as [refactor](refactor.md) does.
+`status` is `int32` of shape `(n_lhs,)`.
 
 `refactor_and_solve_with_status` returns `(x, numeric, status)`. A failed left-hand side still gets its slice of `x` filled with NaN, so either signal can be used.
 
