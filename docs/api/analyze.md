@@ -6,7 +6,7 @@ summary: Symbolic analysis of sparsity pattern
 # analyze
 
 ```python
-klujax.analyze(Ai, Aj, n_col) -> KLUHandleManager
+klujax.analyze(Ai, Aj, n_col) -> SymbolToken
 ```
 
 Perform symbolic analysis on the sparsity pattern of a sparse matrix. This is the first (and most expensive) stage of the KLU algorithm. It studies **where** the nonzeros are (not their values) to find optimal orderings and block structures for the subsequent factorization.
@@ -23,7 +23,7 @@ Perform symbolic analysis on the sparsity pattern of a sparse matrix. This is th
 
 | Type               | Description                                                     |
 | ------------------ | --------------------------------------------------------------- |
-| `KLUHandleManager` | A handle wrapping a C++ pointer to the symbolic analysis result |
+| `SymbolToken` | A handle to the symbolic analysis: a cache id plus the `Ai`, `Aj` it rebuilds from |
 
 ## How It Fits In
 
@@ -65,27 +65,18 @@ for Ax_t, b_t in simulation_data:
 
 ## Memory Management
 
-The returned `KLUHandleManager` wraps a C++ pointer. It cleans up automatically when garbage collected, but you can also manage it explicitly:
+The returned `SymbolToken` is a handle into a bounded cache, not a raw pointer, so there is
+nothing you must do with it. Let it sit unused and the cache evicts it once it overflows
+(`KLUJAX_FACTOR_CACHE`, eight entries by default). If you want the memory back earlier, free
+it sooner with `symbolic.close()`, a `with` block, or [free_symbolic](free.md). See
+[Memory Management](../advanced/memory-management.md) for the full picture, including calling
+`analyze` inside `jax.jit`.
 
 ```python
-# Option 1: Let Python handle it (recommended outside JIT)
-symbolic = klujax.analyze(Ai, Aj, n_col)
-# ... use it ...
-# Freed when `symbolic` goes out of scope
-
-# Option 2: Context manager
 with klujax.analyze(Ai, Aj, n_col) as symbolic:
     x = klujax.solve_with_symbol(Ai, Aj, Ax, b, symbolic)
-# Freed on exit
-
-# Option 3: Explicit close
-symbolic = klujax.analyze(Ai, Aj, n_col)
-x = klujax.solve_with_symbol(Ai, Aj, Ax, b, symbolic)
-symbolic.close()
+# Freed on exit. Still fine to reuse `symbolic` afterwards, it just rebuilds.
 ```
-
-!!! warning "Inside JIT"
-    If you call `analyze` inside a `jax.jit`-compiled function, the handle **will not** be freed automatically. You must call [free_symbolic](free.md) explicitly. See [Memory Management](../advanced/memory-management.md) for details.
 
 !!! note "Not JIT-compiled itself"
     `analyze` is a Python-side function — it runs eagerly on the CPU. Call it **outside** your JIT-compiled loops.

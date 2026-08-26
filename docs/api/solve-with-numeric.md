@@ -15,9 +15,9 @@ Solve **Ax = b** using a pre-computed numeric factorization. This is the fastest
 
 | Parameter  | Type                  | Shape                     | Description                                                |
 | ---------- | --------------------- | ------------------------- | ---------------------------------------------------------- |
-| `numeric`  | KLUHandleManager      | —                         | Handle from [factor](factor.md) or [refactor](refactor.md) |
+| `numeric`  | NumericToken          | —                         | Handle from [factor](factor.md) or [refactor](refactor.md) |
 | `b`        | float64 or complex128 | `(n_lhs?, n_col, n_rhs?)` | Right-hand side                                            |
-| `symbolic` | KLUHandleManager      | —                         | Handle from [analyze](analyze.md)                          |
+| `symbolic` | SymbolToken           | —                         | Handle from [analyze](analyze.md)                          |
 
 ## Returns
 

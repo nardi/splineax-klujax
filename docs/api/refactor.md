@@ -6,7 +6,7 @@ summary: Re-do LU factorization with new values in-place
 # refactor
 
 ```python
-klujax.refactor(Ai, Aj, Ax, numeric, symbolic) -> KLUHandleManager
+klujax.refactor(Ai, Aj, Ax, numeric, symbolic) -> NumericToken
 ```
 
 Re-compute the LU factorization with new matrix values, reusing both the symbolic analysis and the existing numeric handle's memory. This is faster than calling [factor](factor.md) again because it updates the factorization in-place.
@@ -18,14 +18,14 @@ Re-compute the LU factorization with new matrix values, reusing both the symboli
 | `Ai`       | int32                 | `(n_nz,)`        | Row indices                                                       |
 | `Aj`       | int32                 | `(n_nz,)`        | Column indices                                                    |
 | `Ax`       | float64 or complex128 | `(n_lhs?, n_nz)` | **New** matrix values                                             |
-| `numeric`  | KLUHandleManager      | —                | Existing handle from [factor](factor.md) or a previous `refactor` |
-| `symbolic` | KLUHandleManager      | —                | Handle from [analyze](analyze.md)                                 |
+| `numeric`  | NumericToken          | —                | Existing handle from [factor](factor.md) or a previous `refactor` |
+| `symbolic` | SymbolToken           | —                | Handle from [analyze](analyze.md)                                 |
 
 ## Returns
 
 | Type               | Description                                                          |
 | ------------------ | -------------------------------------------------------------------- |
-| `KLUHandleManager` | The same numeric handle, updated in-place with the new factorization |
+| `NumericToken` | The same numeric handle (same cache id), carrying the new values |
 
 ## How It Fits In
 

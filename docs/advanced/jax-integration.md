@@ -101,8 +101,8 @@ J = jax.jacrev(lambda bb: klujax.solve(Ai, Aj, Ax, bb))(b)
 | `Ax`       | Yes             | Continuous matrix values         |
 | `b` / `x`  | Yes             | Continuous vectors               |
 | `Ai`, `Aj` | No              | Integer indices — not continuous |
-| `symbolic` | No              | Opaque C++ pointer               |
-| `numeric`  | No              | Opaque C++ pointer               |
+| `symbolic` | No              | A cache id, not a continuous value |
+| `numeric`  | No              | A cache id, not a continuous value |
 
 ## Vectorized Batching (vmap)
 
@@ -167,15 +167,21 @@ Under the hood, klujax defines separate JAX primitives for float64 and complex12
 
 The Python API automatically dispatches to the correct primitive based on input dtypes.
 
-## KLUHandleManager as JAX Pytree
+## Handle tokens as JAX Pytrees
 
-The `KLUHandleManager` is registered as a JAX pytree node, which is what allows it to be passed through JIT boundaries:
+A handle is a token (`SymbolToken` or `NumericToken`) registered as a JAX pytree
+node, which is what lets it pass through JIT boundaries:
 
 ```python
-# This works because KLUHandleManager is a pytree
+# This works because the token is a pytree
 @jax.jit
 def solve_with_handle(Ax, b, sym):
     return klujax.solve_with_symbol(Ai, Aj, Ax, b, sym)
 ```
 
-The handle's uint64 pointer is the "leaf" and ownership metadata is the "aux data" that travels alongside it.
+The token's leaves are its cache id, the arrays it can rebuild from (`Ai`, `Aj`,
+and for a numeric token `Ax`), and `n_dependent_solutions`, the solve counter a
+free reads for ordering. `n_col` is the static aux data. Because the arrays
+travel with the token, a token whose cached object was evicted rebuilds itself
+rather than dereferencing freed memory. See
+[Memory Management](memory-management.md).

@@ -176,25 +176,22 @@ def test_4d_vmap(dtype, op_sparse):
 def test_analyze():
     Ai, Aj, Ax, b = _get_rand_arrs_1d(15, (n_col := 5), dtype=np.float64)
 
-    # 1. Test Eager Analysis
+    # 1. Test Eager Analysis. A handle is now a SymbolToken carrying its id and
+    # the pattern arrays it can rebuild from, not a raw pointer manager.
     symbolic = klujax.analyze(Ai, Aj, n_col)
-    assert isinstance(symbolic, klujax.KLUHandleManager)
-    assert symbolic._owner is True
+    assert isinstance(symbolic, klujax.SymbolToken)
     assert symbolic.handle.dtype == jnp.uint64
+    assert symbolic.n_col == n_col
 
-    # Manually free to be clean before next step
+    # Freeing is optional now, it just drops the cache slot.
     klujax.free_symbolic(symbolic)
-    assert symbolic._freed is True
 
     @jax.jit
     def jit_analyze_and_solve(Ai, Aj, Ax, b):
-        # Create handle inside JIT
-        sym = klujax.analyze(Ai, Aj, 5)  # Inside JIT, this is a Tracer
-
-        x = klujax.solve_with_symbol(Ai, Aj, Ax, b, sym)
-
-        klujax.free_symbolic(sym, dependency=x)
-        return x
+        # Created inside JIT. The handle is a traced value threaded as data. No
+        # explicit free or dependency barrier is needed: a stale id self-heals.
+        sym = klujax.analyze(Ai, Aj, 5)
+        return klujax.solve_with_symbol(Ai, Aj, Ax, b, sym)
 
     x = jit_analyze_and_solve(Ai, Aj, Ax, b)
     assert x.shape == (n_col,)
@@ -434,7 +431,7 @@ def test_refactor(dtype):
     num = klujax.factor(Ai, Aj, Ax, sym)
 
     num2 = klujax.refactor(Ai, Aj, Ax2, num, sym)
-    assert isinstance(num2, klujax.KLUHandleManager)
+    assert isinstance(num2, klujax.NumericToken)
 
     x_sp = klujax.solve_with_numeric(num2, b2, sym)
     A2 = jnp.zeros((n_col, n_col), dtype=dtype).at[Ai, Aj].add(Ax2)
@@ -456,7 +453,7 @@ def test_refactor_batched(dtype):
     num = klujax.factor(Ai, Aj, Ax, sym)
 
     num2 = klujax.refactor(Ai, Aj, Ax2, num, sym)
-    assert isinstance(num2, klujax.KLUHandleManager)
+    assert isinstance(num2, klujax.NumericToken)
 
     x_sp = klujax.solve_with_numeric(num2, b2, sym)
     op_dense = jax.vmap(jsp.linalg.solve, (0, 0), 0)
@@ -665,14 +662,12 @@ def test_refactor_and_solve(dtype):
     # Verifying specific API order: Ai, Aj, Ax, b, numeric, symbolic
     x_sp, num2 = klujax.refactor_and_solve(Ai, Aj, Ax2, b2, num, sym)
 
-    assert isinstance(num2, klujax.KLUHandleManager)
-    assert num2._owner is False
+    assert isinstance(num2, klujax.NumericToken)
 
     A2 = jnp.zeros((n_col, n_col), dtype=dtype).at[Ai, Aj].add(Ax2)
     x = jsp.linalg.solve(A2, b2)
     _log_and_test_equality(x, x_sp)
 
-    # Original handle must be manually freed because num2 is owner=False
     klujax.free_numeric(num)
     klujax.free_symbolic(sym)
 
@@ -690,8 +685,7 @@ def test_refactor_and_solve_batched(dtype):
     # Verifying specific API order: Ai, Aj, Ax, b, numeric, symbolic
     x_sp, num2 = klujax.refactor_and_solve(Ai, Aj, Ax2, b2, num, sym)
 
-    assert isinstance(num2, klujax.KLUHandleManager)
-    assert num2._owner is False
+    assert isinstance(num2, klujax.NumericToken)
 
     op_dense = jax.vmap(jsp.linalg.solve, (0, 0), 0)
     A2 = jnp.zeros((n_lhs, n_col, n_col), dtype=dtype).at[:, Ai, Aj].add(Ax2)
@@ -989,7 +983,8 @@ def test_refactor_and_solve_with_status(dtype, mode):
     def f(ax):
         num = klujax.factor(Ai, Aj, Ax, sym)
         x, _, status = klujax.refactor_and_solve_with_status(Ai, Aj, ax, b, num, sym)
-        klujax.free_numeric(num, dependency=x)
+        num = num.track(x)
+        klujax.free_numeric(num)
         return x, status
 
     # a failed element reports the status and still gets a NaN solution
@@ -1015,7 +1010,8 @@ def test_rcond(dtype, mode):
     def f(ax):
         num = klujax.factor(Ai, Aj, ax, sym)
         value = klujax.rcond(sym, num, dtype=dtype)
-        klujax.free_numeric(num, dependency=value)
+        num = num.track(value)
+        klujax.free_numeric(num)
         return value
 
     # well conditioned: min|Uii| / max|Uii| = 1/2 here
@@ -1037,7 +1033,8 @@ def test_condest(dtype, mode):
     def f(ax):
         num = klujax.factor(Ai, Aj, ax, sym)
         value = klujax.condest(Ai, Aj, ax, sym, num)
-        klujax.free_numeric(num, dependency=value)
+        num = num.track(value)
+        klujax.free_numeric(num)
         return value
 
     assert _run(mode, f, Ax)[0] == pytest.approx(9.0)
@@ -1058,7 +1055,8 @@ def test_rcond_and_condest_batched(dtype, mode):
         num = klujax.factor(Ai, Aj, ax, sym)
         values = klujax.rcond(sym, num, dtype=dtype)
         conds = klujax.condest(Ai, Aj, ax, sym, num)
-        klujax.free_numeric(num, dependency=conds)
+        num = num.track(conds)
+        klujax.free_numeric(num)
         return values, conds
 
     # only the last left-hand side is near-singular
@@ -1080,8 +1078,10 @@ def test_rcond_vmap(dtype):
     # one batch element carries the near-singular values, the others the benign ones
     Ax_batched = jnp.stack([Ax] * (batch - 1) + [Ax_near])
 
-    nums = jax.vmap(lambda ax: klujax.factor(Ai, Aj, ax, sym).handle)(Ax_batched)
-    values = jax.vmap(lambda h: klujax.rcond(sym, h, dtype=dtype))(nums)
+    # factor returns a NumericToken. Vmapping it gives a token with batched
+    # leaves, which rcond reads back through directly.
+    nums = jax.vmap(lambda ax: klujax.factor(Ai, Aj, ax, sym))(Ax_batched)
+    values = jax.vmap(lambda num: klujax.rcond(sym, num, dtype=dtype))(nums)
 
     assert values.shape == (batch, n_lhs)
     assert jnp.all(values[: batch - 1] > 0.1)
@@ -1091,50 +1091,324 @@ def test_rcond_vmap(dtype):
     klujax.free_symbolic(sym)
 
 
-# KLUHandleManager testing
+# Handle token testing
 
 
-def use_handle(manager, x):
-    """Simulates any function requiring a concrete handle (e.g. a C pointer)."""
-    assert not isinstance(manager.handle, jax.core.Tracer), (
-        "Handle was traced! Got a Tracer instead of a concrete value."
+def test_symbol_token_pytree_roundtrip():
+    """A SymbolToken flattens to its arrays and rebuilds unchanged.
+
+    The token must be a pytree whose leaves are the id and pattern arrays and
+    whose aux is the static n_col, so it can cross jit and vmap boundaries.
+    """
+    Ai, Aj, _, _ = _get_rand_arrs_1d(15, (n_col := 5), dtype=np.float64)
+    sym = klujax.analyze(Ai, Aj, n_col)
+    leaves, treedef = jax.tree_util.tree_flatten(sym)
+    rebuilt = treedef.unflatten(leaves)
+    assert len(leaves) == 4  # id, Ai, Aj, n_dependent_solutions
+    assert int(rebuilt.handle) == int(sym.handle)
+    assert rebuilt.n_col == n_col
+    assert int(rebuilt.n_dependent_solutions) == 0
+    klujax.free_symbolic(sym)
+
+
+def test_numeric_token_pytree_roundtrip():
+    """A NumericToken carries id plus Ai/Aj/Ax and rebuilds unchanged."""
+    Ai, Aj, Ax, _ = _get_rand_arrs_1d(15, (n_col := 5), dtype=np.float64)
+    sym = klujax.analyze(Ai, Aj, n_col)
+    num = klujax.factor(Ai, Aj, Ax, sym)
+    leaves, treedef = jax.tree_util.tree_flatten(num)
+    rebuilt = treedef.unflatten(leaves)
+    assert len(leaves) == 5  # id, Ai, Aj, Ax, n_dependent_solutions
+    assert rebuilt.n_col == n_col
+    assert int(rebuilt.n_dependent_solutions) == 0
+    klujax.free_numeric(num)
+    klujax.free_symbolic(sym)
+
+
+def test_token_flows_through_jit():
+    """A token created outside jit is usable inside it, threaded as data.
+
+    Unlike the old pointer manager, the token's id is an ordinary array, so it
+    traces into a jitted function and the solve there works normally.
+    """
+    Ai, Aj, Ax, b = _get_rand_arrs_1d(15, (n_col := 5), dtype=np.float64)
+    sym = klujax.analyze(Ai, Aj, n_col)
+    num = klujax.factor(Ai, Aj, Ax, sym)
+
+    @jax.jit
+    def solve(num, b):
+        return klujax.solve_with_numeric(num, b, sym)
+
+    x = solve(num, b)
+    A = jnp.zeros((n_col, n_col), dtype=Ax.dtype).at[Ai, Aj].add(Ax)
+    _log_and_test_equality(jsp.linalg.solve(A, b), x)
+    klujax.free_numeric(num)
+    klujax.free_symbolic(sym)
+
+
+# Handle cache: bounded memory, rebuild-on-miss, strict mode ==================
+# These pin the memory-safety contract: a handle is a key into a bounded cache,
+# never a raw pointer, so forgetting to free leaks only the cache, and a handle
+# whose factorization was evicted or freed rebuilds from the arrays it carries
+# instead of reading freed memory.
+
+
+def _dense(Ai, Aj, Ax, n_col, dtype):
+    return jnp.zeros((n_col, n_col), dtype=dtype).at[Ai, Aj].add(Ax)
+
+
+@log_test_name
+def test_forgotten_handles_are_bounded_and_rebuild(monkeypatch):
+    """Never freeing handles stays bounded, and an evicted one still solves.
+
+    With the cache capped at two, factoring many systems without freeing cannot
+    grow the registry without end. Solving through the first handle then rebuilds
+    its factorization, which we check stays correct and bumps the rebuild count.
+    """
+    monkeypatch.setenv("KLUJAX_FACTOR_CACHE", "2")
+    Ai, Aj, Ax, b = _get_rand_arrs_1d(15, (n_col := 5), dtype=np.float64)
+    sym = klujax.analyze(Ai, Aj, n_col)
+
+    first = klujax.factor(Ai, Aj, Ax, sym)
+    for _ in range(5):
+        klujax.factor(Ai, Aj, Ax, sym)  # evicts older entries, first included
+
+    klujax.reset_rebuild_count()
+    x = klujax.solve_with_numeric(first, b, sym)
+    assert klujax.rebuild_count() >= 1
+    _log_and_test_equality(
+        jsp.linalg.solve(_dense(Ai, Aj, Ax, n_col, np.float64), b), x
     )
-    return x * 2.0
 
 
-def test_registration_traces_handle():
-    manager = klujax.KLUHandleManager(
-        jnp.array(0xDEADBEEF, dtype=jnp.int64), free_callable=lambda x: None
+@log_test_name
+def test_strict_mode_turns_a_rebuild_into_an_error(monkeypatch):
+    """Strict mode raises instead of silently rebuilding an evicted handle.
+
+    A silent rebuild is correct but slow, so strict mode is the switch that makes
+    a lost factorization loud while debugging. We force an eviction with a tiny
+    cache, then check the next solve raises and names strict mode.
+    """
+    # Capacity 2 holds the symbolic plus one numeric. A second numeric then
+    # evicts the first, which strict mode refuses to rebuild.
+    monkeypatch.setenv("KLUJAX_FACTOR_CACHE", "2")
+    monkeypatch.setenv("KLUJAX_STRICT_CACHE", "1")
+    Ai, Aj, Ax, b = _get_rand_arrs_1d(15, (n_col := 5), dtype=np.float64)
+    sym = klujax.analyze(Ai, Aj, n_col)
+    first = klujax.factor(Ai, Aj, Ax, sym)
+    klujax.factor(Ai, Aj, Ax, sym)  # evicts first
+
+    with pytest.raises(Exception, match="strict cache mode"):
+        klujax.solve_with_numeric(first, b, sym)
+
+
+@log_test_name
+@parametrize_dtypes
+def test_released_handle_rebuilds_on_next_solve(dtype):
+    """An explicitly freed handle self-heals when solved through again.
+
+    free_numeric only drops the cache slot; the token stays valid and rebuilds
+    from the matrix the solve carries. This is the freeing-is-optional guarantee.
+    """
+    Ai, Aj, Ax, b = _get_rand_arrs_1d(15, (n_col := 5), dtype=dtype)
+    sym = klujax.analyze(Ai, Aj, n_col)
+    num = klujax.factor(Ai, Aj, Ax, sym)
+    klujax.free_numeric(num)
+
+    klujax.reset_rebuild_count()
+    x = klujax.solve_with_numeric(num, b, sym)
+    assert klujax.rebuild_count() >= 1
+    _log_and_test_equality(jsp.linalg.solve(_dense(Ai, Aj, Ax, n_col, dtype), b), x)
+
+
+@log_test_name
+def test_full_lifecycle_inside_jit():
+    """analyze, factor, solve, and free run correctly inside one jit.
+
+    The handle is threaded as data, so XLA orders the lifecycle by data
+    dependency. We check the jitted answer matches a dense solve, which is what
+    lets the cache scheme be used from inside compiled code.
+    """
+    Ai, Aj, Ax, b = _get_rand_arrs_1d(15, (n_col := 5), dtype=np.float64)
+
+    @jax.jit
+    def run(Ai, Aj, Ax, b):
+        sym = klujax.analyze(Ai, Aj, n_col)
+        num = klujax.factor(Ai, Aj, Ax, sym)
+        x = klujax.solve_with_numeric(num, b, sym)
+        klujax.free_numeric(num)
+        klujax.free_symbolic(sym)
+        return x
+
+    x = run(Ai, Aj, Ax, b)
+    _log_and_test_equality(
+        jsp.linalg.solve(_dense(Ai, Aj, Ax, n_col, np.float64), b), x
     )
 
-    fn = jax.jit(use_handle)
-    result = fn(manager, jnp.array(1.0))
-    assert jnp.allclose(result, 2.0)
 
+@log_test_name
+def test_eager_factor_then_jitted_solve_self_heals(monkeypatch):
+    """A handle built eagerly, then evicted, still solves inside a later jit.
 
-def test_registration_handle_concrete_under_grad():
-    manager = klujax.KLUHandleManager(
-        jnp.array(0xDEADBEEF, dtype=jnp.int64), free_callable=lambda x: None
+    This is the mixed eager/jit case: the factorization is built eagerly, the
+    cache is overrun so the handle is evicted, and a jitted solve reaches the
+    missing handle and rebuilds. We check the answer is still correct.
+    """
+    monkeypatch.setenv("KLUJAX_FACTOR_CACHE", "1")
+    Ai, Aj, Ax, b = _get_rand_arrs_1d(15, (n_col := 5), dtype=np.float64)
+    sym = klujax.analyze(Ai, Aj, n_col)
+    num = klujax.factor(Ai, Aj, Ax, sym)
+    klujax.factor(Ai, Aj, Ax, sym)  # evicts num (capacity 1)
+
+    @jax.jit
+    def solve(b):
+        return klujax.solve_with_numeric(num, b, sym)
+
+    klujax.reset_rebuild_count()
+    x = solve(b)
+    assert klujax.rebuild_count() >= 1
+    _log_and_test_equality(
+        jsp.linalg.solve(_dense(Ai, Aj, Ax, n_col, np.float64), b), x
     )
-    fn = jax.grad(lambda x: use_handle(manager, x))
-    fn(jnp.array(1.0))
 
 
-def test_handle_survives_pytree_roundtrip():
-    handle_val = jnp.array(0xDEADBEEF, dtype=jnp.int64)
-    manager = klujax.KLUHandleManager(handle_val, free_callable=lambda x: None)
-
-    leaves, treedef = jax.tree_util.tree_flatten(manager)
-    reconstructed = treedef.unflatten(leaves)
-
-    assert leaves == []
-    assert int(reconstructed.handle) == int(handle_val)
+# Ordering an explicit free after solves ======================================
+# A bare free inside a jit trace is unordered against a solve on the same token,
+# so it may run first and be undone by the solve's rebuild. track and the
+# dependency argument make the free wait. These check the free costs no rebuild,
+# which is the observable sign it ran after the solve.
 
 
-def test_registration_handle_concrete_under_vmap():
-    manager = klujax.KLUHandleManager(
-        jnp.array(0xDEADBEEF, dtype=jnp.int64), free_callable=lambda x: None
+@log_test_name
+def test_track_orders_a_free_after_the_solve():
+    """num.track makes an in-trace free wait for the solve, so no rebuild."""
+    Ai, Aj, Ax, b = _get_rand_arrs_1d(15, (n_col := 5), dtype=np.float64)
+    sym = klujax.analyze(Ai, Aj, n_col)
+    num = klujax.factor(Ai, Aj, Ax, sym)
+
+    @jax.jit
+    def step(num, b):
+        x = klujax.solve_with_numeric(num, b, sym)
+        klujax.free_numeric(num.track(x))
+        return x
+
+    klujax.reset_rebuild_count()
+    x = step(num, b)
+    assert klujax.rebuild_count() == 0
+    _log_and_test_equality(
+        jsp.linalg.solve(_dense(Ai, Aj, Ax, n_col, np.float64), b), x
     )
-    fn = jax.vmap(lambda x: use_handle(manager, x))
-    result = fn(jnp.ones((4,)))
-    assert jnp.allclose(result, 2.0)
+    klujax.free_symbolic(sym)
+
+
+@log_test_name
+def test_free_dependency_orders_after_the_solve():
+    """free_numeric(num, dependency=x) orders the free after that solve."""
+    Ai, Aj, Ax, b = _get_rand_arrs_1d(15, (n_col := 5), dtype=np.float64)
+    sym = klujax.analyze(Ai, Aj, n_col)
+    num = klujax.factor(Ai, Aj, Ax, sym)
+
+    @jax.jit
+    def step(num, b):
+        x = klujax.solve_with_numeric(num, b, sym)
+        klujax.free_numeric(num, dependency=x)
+        return x
+
+    klujax.reset_rebuild_count()
+    x = step(num, b)
+    assert klujax.rebuild_count() == 0
+    _log_and_test_equality(
+        jsp.linalg.solve(_dense(Ai, Aj, Ax, n_col, np.float64), b), x
+    )
+    klujax.free_symbolic(sym)
+
+
+@log_test_name
+def test_track_counts_solutions():
+    """n_dependent_solutions counts the solutions tracked into a token."""
+    Ai, Aj, Ax, b = _get_rand_arrs_1d(15, (n_col := 5), dtype=np.float64)
+    sym = klujax.analyze(Ai, Aj, n_col)
+    num = klujax.factor(Ai, Aj, Ax, sym)
+    assert int(num.n_dependent_solutions) == 0
+    num = num.track(b).track(b).track(b)
+    assert int(num.n_dependent_solutions) == 3
+    klujax.free_numeric(num)
+    klujax.free_symbolic(sym)
+
+
+@log_test_name
+def test_free_without_ordering_still_frees_and_stays_correct():
+    """A free with neither track nor dependency still frees and self-heals.
+
+    Ordering only affects whether an early free wastes a rebuild, never
+    correctness, so this checks a bare free eagerly frees and a later solve on
+    the same token still gives the right answer.
+    """
+    Ai, Aj, Ax, b = _get_rand_arrs_1d(15, (n_col := 5), dtype=np.float64)
+    sym = klujax.analyze(Ai, Aj, n_col)
+    num = klujax.factor(Ai, Aj, Ax, sym)
+    klujax.free_numeric(num)
+    x = klujax.solve_with_numeric(num, b, sym)
+    _log_and_test_equality(
+        jsp.linalg.solve(_dense(Ai, Aj, Ax, n_col, np.float64), b), x
+    )
+    klujax.free_symbolic(sym)
+
+
+@log_test_name
+def test_many_solves_in_a_scan_then_free():
+    """A token threads through lax.scan, and a free after it costs no rebuild.
+
+    Each step solves and tracks its solution, so after the loop the free is
+    ordered behind every solve. We check no rebuild, the counter equals the step
+    count, and each solution matches a dense solve. This also confirms the token
+    is a valid scan carry, since its shape stays fixed across steps.
+    """
+    Ai, Aj, Ax, b = _get_rand_arrs_1d(15, (n_col := 5), dtype=np.float64)
+    sym = klujax.analyze(Ai, Aj, n_col)
+    num = klujax.factor(Ai, Aj, Ax, sym)
+    bs = jnp.stack([b * scale for scale in (1.0, 2.0, 3.0)])
+
+    @jax.jit
+    def run(num, bs):
+        def step(num, b):
+            x = klujax.solve_with_numeric(num, b, sym)
+            return num.track(x), x
+
+        num, xs = lax.scan(step, num, bs)
+        klujax.free_numeric(num)
+        return num.n_dependent_solutions, xs
+
+    klujax.reset_rebuild_count()
+    count, xs = run(num, bs)
+    assert klujax.rebuild_count() == 0
+    assert int(count) == bs.shape[0]
+    A = _dense(Ai, Aj, Ax, n_col, np.float64)
+    _log_and_test_equality(jax.vmap(lambda bb: jsp.linalg.solve(A, bb))(bs), xs)
+    klujax.free_symbolic(sym)
+
+
+@log_test_name
+def test_many_solves_in_a_vmap_then_free():
+    """A vmapped batch of solves tracked and freed costs no rebuild.
+
+    The batch of solves runs in one vmapped call. Tracking the batched solution
+    orders the free after it, so we check no rebuild and a correct batched answer.
+    """
+    Ai, Aj, Ax, b = _get_rand_arrs_1d(15, (n_col := 5), dtype=np.float64)
+    sym = klujax.analyze(Ai, Aj, n_col)
+    num = klujax.factor(Ai, Aj, Ax, sym)
+    bs = jnp.stack([b * scale for scale in (1.0, 2.0, 3.0)])
+
+    @jax.jit
+    def run(num, bs):
+        xs = jax.vmap(lambda bb: klujax.solve_with_numeric(num, bb, sym))(bs)
+        klujax.free_numeric(num.track(xs))
+        return xs
+
+    klujax.reset_rebuild_count()
+    xs = run(num, bs)
+    assert klujax.rebuild_count() == 0
+    A = _dense(Ai, Aj, Ax, n_col, np.float64)
+    _log_and_test_equality(jax.vmap(lambda bb: jsp.linalg.solve(A, bb))(bs), xs)
+    klujax.free_symbolic(sym)

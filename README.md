@@ -112,7 +112,7 @@ import jax
 import klujax
 
 # 1. Analyze once in Python (CPU)
-# Returns a KLUHandleManager that automatically cleans up C++ memory
+# Returns a SymbolToken: a cache handle that is freed automatically
 symbolic = klujax.analyze(Ai, Aj, n_col)
 
 @jax.jit
@@ -166,44 +166,49 @@ if klujax.rcond(symbolic, numeric)[0] < 1e-10:
     ...  # pivots have degraded, re-factor from scratch
 ```
 
-### Lifecycle & Pointer Pitfalls
+### Lifecycle & Memory Safety
 
-Because `klujax.analyze` and `klujax.factor` generate `KLUHandleManager` objects which wrap low level C++ pointers, there are strict rules for avoiding memory leaks and segmentation faults.
+`klujax.analyze` and `klujax.factor` return handle tokens (`SymbolToken`,
+`NumericToken`). A token is a small cache id bundled with the arrays it can
+rebuild from, not a raw pointer, so handles are memory-safe by construction.
 
-#### The "Ghost Pointer" Problem inside JIT:
+- **Forgetting to free leaks only a bounded amount.** Handles live in a
+  process-wide cache that holds a fixed number of KLU objects (eight by
+  default, set by `KLUJAX_FACTOR_CACHE`). When it overflows, the least recently
+  used object is evicted.
 
-JAX's jit works by tracing your code. During tracing, Python objects like the `KLUHandleManager` are converted into symbolic Tracers.
+- **Using a freed or evicted handle is safe.** Every call carries the matrix the
+  handle needs, so a call that lands on a missing handle rebuilds it on the spot
+  and continues. This is why freeing is optional and there is no ghost-pointer
+  hazard: there is no pointer to dereference.
 
-- Outside JIT: The `KLUHandleManager` uses RAII (Resource Acquisition Is Initialization). When the Python variable is deleted or goes out of scope, the C++ memory is freed automatically.
-
-- Inside JIT: If you create a handle (via `analyze` or `factor`) **inside** a JIT-compiled function, the Python manager is "lost" during the conversion to XLA. XLA will allocate the C++ memory at runtime, but it will **never** call the free function.
-
-#### The Fix: Explicit Destruction with Dependencies
-
-If you must create a handle inside JIT, you must manually call `free_symbolic` or `free_numeric` inside that same function. To prevent the compiler from freeing the pointer before the solve is finished, you must pass the solution as a dependency.
+Because of this, creating a token inside `jax.jit` needs no special care. The id
+threads through the trace as data. A bare free is unordered against the solve, so
+to actually free inside the trace, order it after the solve by tracking the
+solution (or passing it as `dependency`):
 
 ```python
 @jax.jit
 def dynamic_solve(Ai, Aj, Ax, b):
-    # 1. Born inside JIT (No automatic cleanup!)
     sym = klujax.analyze(Ai, Aj, 5)
-
-    # 2. Compute solution
     x = klujax.solve_with_symbol(Ai, Aj, Ax, b, sym)
-
-    # 3. CRITICAL: Force XLA to free 'sym' ONLY AFTER 'x' is ready
-    klujax.free_symbolic(sym, dependency=x)
-
+    klujax.free_symbolic(sym.track(x))   # ordered after the solve
     return x
 ```
 
 #### Summary of Best Practices
 
-1. **Hoist Creations**: Always try to call analyze or factor outside of JIT blocks.
+1. **Hoist Creations**: for best performance, call `analyze` or `factor` once
+   outside JIT loops and reuse the handle.
 
-2. **One Manager, One Free**: Do not manually call free_symbolic(manager) and then let the manager go out of scope; it will attempt a double-free (though the library has safeguards to prevent a crash).
+2. **Freeing is optional**: use `free_symbolic` / `free_numeric` (or the token's
+   `close()`, or a `with` block) only to release memory sooner. The token stays
+   usable afterwards.
 
-3. **Check for Warnings**: If you see a UserWarning: Allocating KLU handle inside JIT, your code is currently leaking memory. Use the dependency pattern shown above to fix it.
+3. **Watch `rebuild_count()`**: a count that climbs during steady-state solving
+   means the working set is larger than `KLUJAX_FACTOR_CACHE`. Set
+   `KLUJAX_STRICT_CACHE` to turn a rebuild into an error while debugging. See
+   the [Memory Management](docs/advanced/memory-management.md) guide.
 
 ## Installation
 

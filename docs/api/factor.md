@@ -6,7 +6,7 @@ summary: Numeric LU factorization
 # factor
 
 ```python
-klujax.factor(Ai, Aj, Ax, symbolic) -> KLUHandleManager
+klujax.factor(Ai, Aj, Ax, symbolic) -> NumericToken
 ```
 
 Perform numeric LU factorization using a pre-computed symbolic analysis. This computes **A = LU** (lower × upper triangular decomposition) using the actual matrix values, given the structural information from [analyze](analyze.md).
@@ -18,13 +18,13 @@ Perform numeric LU factorization using a pre-computed symbolic analysis. This co
 | `Ai`       | int32                 | `(n_nz,)`        | Row indices                       |
 | `Aj`       | int32                 | `(n_nz,)`        | Column indices                    |
 | `Ax`       | float64 or complex128 | `(n_lhs?, n_nz)` | Matrix values                     |
-| `symbolic` | KLUHandleManager      | —                | Handle from [analyze](analyze.md) |
+| `symbolic` | SymbolToken           | —                | Handle from [analyze](analyze.md) |
 
 ## Returns
 
 | Type               | Description                                    |
 | ------------------ | ---------------------------------------------- |
-| `KLUHandleManager` | A handle wrapping the numeric LU factorization |
+| `NumericToken` | A handle to the numeric LU factorization (cache id plus `Ai`, `Aj`, `Ax`) |
 
 ## How It Fits In
 
@@ -75,7 +75,10 @@ numeric = klujax.factor(Ai, Aj, Ax_batch, symbolic)
 
 ## Memory Management
 
-Same rules as [analyze](analyze.md#memory-management) — the handle cleans up automatically outside JIT, but needs explicit [free_numeric](free.md) inside JIT.
+Same rules as [analyze](analyze.md#memory-management): the returned `NumericToken` is a
+bounded-cache handle, not a raw pointer, so freeing it with `numeric.close()` or
+[free_numeric](free.md) is always optional, inside `jax.jit` or out of it. See
+[Memory Management](../advanced/memory-management.md) for the full picture.
 
 ## When to Use factor vs. solve_with_symbol
 
