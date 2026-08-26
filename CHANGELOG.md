@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.5.0.post4
+
+- Handles are now cache tokens instead of raw pointers
+- `KLUHandleManager` replaced by `SymbolToken` and `NumericToken`, which are
+  JAX pytrees carrying their rebuild arrays as leaves
+- New `KLUJAX_FACTOR_CACHE` env var sets the max live KLU objects (default 8)
+- New `KLUJAX_STRICT_CACHE` env var turns a rebuild into an error for debugging
+- New `rebuild_count()` and `reset_rebuild_count()` to detect cache pressure
+- New `token = token.track(solution)` API to order a free after a solve inside `jax.jit`
+
 ## 0.5.0.post3
 
 - New `refactor_with_status` and `refactor_and_solve_with_status` report a failed
