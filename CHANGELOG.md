@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.0.post5
+
+- Set default n_dependent_solutions explicitly to fix pytree interop (e.g. `eqx.partition`)
+
 ## 0.5.0.post4
 
 - Handles are now cache tokens instead of raw pointers

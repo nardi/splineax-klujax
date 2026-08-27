@@ -1265,7 +1265,7 @@ wheels = [
 
 [[package]]
 name = "splineax-klujax"
-version = "0.5.0.post4"
+version = "0.5.0.post5"
 source = { editable = "." }
 dependencies = [
     { name = "jax" },
