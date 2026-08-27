@@ -228,6 +228,8 @@ class KLUStatus(enum.IntEnum):
 # and use after free is safe. The arrays are pytree children so the token flows
 # through jit, vmap, and grad. n_col is static aux.
 
+_ZERO_DEPS = jnp.zeros((), jnp.int32)
+
 
 def _ordering_witness(solution: Array) -> Array:
     """Return a zero-valued int32 that XLA cannot fold away, so it forces ordering.
@@ -259,18 +261,14 @@ class SymbolToken:
         Ai: Array,
         Aj: Array,
         n_col: int,
-        n_dependent_solutions: Array | None = None,
+        n_dependent_solutions: Array,
     ) -> None:
         """Store the cache id, the pattern arrays, the static n_col, and the counter."""
         self.id = id
         self.Ai = Ai
         self.Aj = Aj
         self.n_col = n_col
-        self.n_dependent_solutions = (
-            jnp.zeros((), jnp.int32)
-            if n_dependent_solutions is None
-            else n_dependent_solutions
-        )
+        self.n_dependent_solutions = n_dependent_solutions
 
     @property
     def handle(self) -> Array:
@@ -316,7 +314,7 @@ class NumericToken:
         Aj: Array,
         Ax: Array,
         n_col: int,
-        n_dependent_solutions: Array | None = None,
+        n_dependent_solutions: Array,
     ) -> None:
         """Store the cache ids, the matrix arrays, the static n_col, and the counter."""
         self.id = id
@@ -324,11 +322,7 @@ class NumericToken:
         self.Aj = Aj
         self.Ax = Ax
         self.n_col = n_col
-        self.n_dependent_solutions = (
-            jnp.zeros((), jnp.int32)
-            if n_dependent_solutions is None
-            else n_dependent_solutions
-        )
+        self.n_dependent_solutions = n_dependent_solutions
 
     @property
     def handle(self) -> Array:
@@ -452,7 +446,7 @@ def analyze(Ai: Array, Aj: Array, n_col: int) -> SymbolToken:
     Aj = jnp.asarray(Aj, dtype=jnp.int32)
     sym_id = analyze_p.bind(Ai, Aj, jnp.int32(n_col))
     # The token carries Ai/Aj so the analysis can be rebuilt if it is evicted.
-    return SymbolToken(sym_id, Ai, Aj, int(n_col))
+    return SymbolToken(sym_id, Ai, Aj, int(n_col), _ZERO_DEPS)
 
 
 def validate_numeric_solve(
@@ -636,7 +630,7 @@ def factor(Ai: Array, Aj: Array, Ax: Array, symbolic: SymbolToken) -> NumericTok
     Aj = jnp.asarray(Aj, dtype=jnp.int32)
     num_id = cast("Any", _factor_jit)(Ai, Aj, Ax, sym_h, n_col=n_col)
     # The token carries the matrix so an evicted factorization rebuilds from it.
-    return NumericToken(num_id, Ai, Aj, _as_batched_values(Ax), n_col)
+    return NumericToken(num_id, Ai, Aj, _as_batched_values(Ax), n_col, _ZERO_DEPS)
 
 
 @partial(jax.jit, static_argnames=("n_col",))
@@ -685,7 +679,7 @@ def refactor(
     Ai = jnp.asarray(Ai, dtype=jnp.int32)
     Aj = jnp.asarray(Aj, dtype=jnp.int32)
     out_id = cast("Any", _refactor_jit)(Ai, Aj, Ax, sym_h, num_h, n_col=n_col)
-    return NumericToken(out_id, Ai, Aj, _as_batched_values(Ax), n_col)
+    return NumericToken(out_id, Ai, Aj, _as_batched_values(Ax), n_col, _ZERO_DEPS)
 
 
 @partial(jax.jit, static_argnames=("n_col",))
@@ -741,7 +735,8 @@ def refactor_with_status(
     out_id, status = cast("Any", _refactor_with_status_jit)(
         Ai, Aj, Ax, sym_h, num_h, n_col=n_col
     )
-    return NumericToken(out_id, Ai, Aj, _as_batched_values(Ax), n_col), status
+    token = NumericToken(out_id, Ai, Aj, _as_batched_values(Ax), n_col, _ZERO_DEPS)
+    return token, status
 
 
 @partial(jax.jit, static_argnames=("is_complex", "n_col"))
@@ -999,7 +994,7 @@ def refactor_and_solve(
     Ai = jnp.asarray(Ai, dtype=jnp.int32)
     Aj = jnp.asarray(Aj, dtype=jnp.int32)
     x, out_id = _refactor_and_solve_jit(Ai, Aj, Ax, b, sym_h, num_h)
-    return x, NumericToken(out_id, Ai, Aj, _as_batched_values(Ax), n_col)
+    return x, NumericToken(out_id, Ai, Aj, _as_batched_values(Ax), n_col, _ZERO_DEPS)
 
 
 @jax.jit
@@ -1062,7 +1057,8 @@ def refactor_and_solve_with_status(
     Ai = jnp.asarray(Ai, dtype=jnp.int32)
     Aj = jnp.asarray(Aj, dtype=jnp.int32)
     x, out_id, status = _refactor_and_solve_with_status_jit(Ai, Aj, Ax, b, sym_h, num_h)
-    return x, NumericToken(out_id, Ai, Aj, _as_batched_values(Ax), n_col), status
+    token = NumericToken(out_id, Ai, Aj, _as_batched_values(Ax), n_col, _ZERO_DEPS)
+    return x, token, status
 
 
 # Primitives ==========================================================================
