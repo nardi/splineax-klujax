@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+- `solve_with_numeric`, `tsolve_with_numeric`, `rcond`, and `condest` take a new
+  `return_token=True` keyword. With it they return `(result, NumericToken)`. Thread
+  that token into a later `refactor` so the write waits on the read. Without a token
+  the write and the read both take `factor`'s output and nothing orders them, so
+  under `jit` XLA can run the in-place write first and the earlier read then sees
+  the later matrix. The default stays `return_token=False`, so old calls are unchanged.
+- `NumericToken` gains a `version` field. Each write, meaning `factor` and
+  `refactor`, stamps a fresh version on the slot and the token carries it. A read
+  through a token compares its version against the slot and reports a mismatch
+  instead of returning a wrong answer, which catches a token reused after the slot
+  was overwritten.
+
 ## 0.5.0.post5
 
 - Set default n_dependent_solutions explicitly to fix pytree interop (e.g. `eqx.partition`)

@@ -230,6 +230,11 @@ class KLUStatus(enum.IntEnum):
 
 _ZERO_DEPS = jnp.zeros((), jnp.int32)
 
+# An unstamped version. The native side skips the staleness check when it sees 0,
+# so a token built without a real version never triggers a false mismatch. It is a
+# numpy array so it stays uint64 even before x64 is turned on at import time.
+_ZERO_VERSION = np.zeros((1,), np.uint64)
+
 
 def _ordering_witness(solution: Array) -> Array:
     """Return a zero-valued int32 that XLA cannot fold away, so it forces ordering.
@@ -305,6 +310,11 @@ class NumericToken:
 
     n_dependent_solutions counts the solutions passed to track. free_numeric
     consumes it so a free is ordered after those solves even inside a jit trace.
+
+    version is the slot version the native side stamped when this factorization was
+    written. A read passes it back so the native call can flag a token that points
+    at a slot a later refactor has already overwritten. See refactor and the
+    return_token option on solve_with_numeric.
     """
 
     def __init__(
@@ -315,6 +325,7 @@ class NumericToken:
         Ax: Array,
         n_col: int,
         n_dependent_solutions: Array,
+        version: Array | None = None,
     ) -> None:
         """Store the cache ids, the matrix arrays, the static n_col, and the counter."""
         self.id = id
@@ -323,6 +334,8 @@ class NumericToken:
         self.Ax = Ax
         self.n_col = n_col
         self.n_dependent_solutions = n_dependent_solutions
+        self.version = _ZERO_VERSION if version is None else version
+        """Per-slot version stamped by the last write, or zeros when unstamped."""
 
     @property
     def handle(self) -> Array:
@@ -338,6 +351,7 @@ class NumericToken:
             self.Ax,
             self.n_col,
             _track(self.n_dependent_solutions, solutions),
+            self.version,
         )
 
     def __enter__(self) -> Self:
@@ -363,8 +377,11 @@ jax.tree_util.register_pytree_node(
 
 jax.tree_util.register_pytree_node(
     NumericToken,
-    lambda t: ((t.id, t.Ai, t.Aj, t.Ax, t.n_dependent_solutions), (t.n_col,)),
-    lambda aux, ch: NumericToken(ch[0], ch[1], ch[2], ch[3], aux[0], ch[4]),
+    lambda t: (
+        (t.id, t.Ai, t.Aj, t.Ax, t.n_dependent_solutions, t.version),
+        (t.n_col,),
+    ),
+    lambda aux, ch: NumericToken(ch[0], ch[1], ch[2], ch[3], aux[0], ch[4], ch[5]),
 )
 
 
@@ -602,8 +619,33 @@ def _as_batched_values(Ax: Array) -> Array:
     return Ax if Ax.ndim == 2 else Ax[None, :]
 
 
+def _ordered_token(numeric: NumericToken, result: Array) -> NumericToken:
+    """Return a token whose id waits on a read's result.
+
+    A read has no output a later write can depend on, so XLA may run an in-place
+    refactor before it. `order_after` takes the result as an ordering operand and
+    passes the numeric id back, which threads the read and the next write onto one
+    chain. The version rides along so a stale token is still caught. See order_after.
+    """
+    if not isinstance(numeric, NumericToken):
+        msg = "return_token=True needs the NumericToken from factor()/refactor()."
+        raise TypeError(msg)
+    out_id = order_after_p.bind(numeric.id, numeric.version, result)
+    return NumericToken(
+        out_id,
+        numeric.Ai,
+        numeric.Aj,
+        numeric.Ax,
+        numeric.n_col,
+        _ZERO_DEPS,
+        numeric.version,
+    )
+
+
 @partial(jax.jit, static_argnames=("n_col",))
-def _factor_jit(Ai: Array, Aj: Array, Ax: Array, sym_h: Array, *, n_col: int) -> Array:
+def _factor_jit(
+    Ai: Array, Aj: Array, Ax: Array, sym_h: Array, *, n_col: int
+) -> tuple[Array, Array]:
     dummy_b = jnp.zeros((1,), dtype=Ax.dtype)
     Ai, Aj, Ax, _, _ = validate_args(Ai, Aj, Ax, dummy_b)
     prim = factor_c128 if Ax.dtype in COMPLEX_DTYPES else factor_f64
@@ -628,15 +670,17 @@ def factor(Ai: Array, Aj: Array, Ax: Array, symbolic: SymbolToken) -> NumericTok
     n_col = _n_col_of(symbolic)
     Ai = jnp.asarray(Ai, dtype=jnp.int32)
     Aj = jnp.asarray(Aj, dtype=jnp.int32)
-    num_id = cast("Any", _factor_jit)(Ai, Aj, Ax, sym_h, n_col=n_col)
+    num_id, version = cast("Any", _factor_jit)(Ai, Aj, Ax, sym_h, n_col=n_col)
     # The token carries the matrix so an evicted factorization rebuilds from it.
-    return NumericToken(num_id, Ai, Aj, _as_batched_values(Ax), n_col, _ZERO_DEPS)
+    return NumericToken(
+        num_id, Ai, Aj, _as_batched_values(Ax), n_col, _ZERO_DEPS, version
+    )
 
 
 @partial(jax.jit, static_argnames=("n_col",))
 def _refactor_jit(
     Ai: Array, Aj: Array, Ax: Array, sym_h: Array, num_h: Array, *, n_col: int
-) -> Array:
+) -> tuple[Array, Array]:
     dummy_b = jnp.zeros((1,), dtype=Ax.dtype)
     Ai, Aj, Ax, _, _ = validate_args(Ai, Aj, Ax, dummy_b)
     prim = refactor_c128 if Ax.dtype in COMPLEX_DTYPES else refactor_f64
@@ -678,21 +722,23 @@ def refactor(
     n_col = _n_col_of(symbolic)
     Ai = jnp.asarray(Ai, dtype=jnp.int32)
     Aj = jnp.asarray(Aj, dtype=jnp.int32)
-    out_id = cast("Any", _refactor_jit)(Ai, Aj, Ax, sym_h, num_h, n_col=n_col)
-    return NumericToken(out_id, Ai, Aj, _as_batched_values(Ax), n_col, _ZERO_DEPS)
+    out_id, version = cast("Any", _refactor_jit)(Ai, Aj, Ax, sym_h, num_h, n_col=n_col)
+    return NumericToken(
+        out_id, Ai, Aj, _as_batched_values(Ax), n_col, _ZERO_DEPS, version
+    )
 
 
 @partial(jax.jit, static_argnames=("n_col",))
 def _refactor_with_status_jit(
     Ai: Array, Aj: Array, Ax: Array, sym_h: Array, num_h: Array, *, n_col: int
-) -> tuple[Array, Array]:
+) -> tuple[Array, Array, Array]:
     dummy_b = jnp.zeros((1,), dtype=Ax.dtype)
     Ai, Aj, Ax, _, _ = validate_args(Ai, Aj, Ax, dummy_b)
     prim = refactor_status_c128 if Ax.dtype in COMPLEX_DTYPES else refactor_status_f64
-    raw_handle, status = prim.bind(
+    raw_handle, version, status = prim.bind(
         Ai.astype(jnp.int32), Aj.astype(jnp.int32), Ax, sym_h, num_h, n_col=n_col
     )
-    return raw_handle, status
+    return raw_handle, version, status
 
 
 def refactor_with_status(
@@ -732,10 +778,12 @@ def refactor_with_status(
     n_col = _n_col_of(symbolic)
     Ai = jnp.asarray(Ai, dtype=jnp.int32)
     Aj = jnp.asarray(Aj, dtype=jnp.int32)
-    out_id, status = cast("Any", _refactor_with_status_jit)(
+    out_id, version, status = cast("Any", _refactor_with_status_jit)(
         Ai, Aj, Ax, sym_h, num_h, n_col=n_col
     )
-    token = NumericToken(out_id, Ai, Aj, _as_batched_values(Ax), n_col, _ZERO_DEPS)
+    token = NumericToken(
+        out_id, Ai, Aj, _as_batched_values(Ax), n_col, _ZERO_DEPS, version
+    )
     return token, status
 
 
@@ -767,7 +815,8 @@ def rcond(
     numeric: NumericToken,
     *,
     dtype: Any = jnp.float64,  # noqa: ANN401
-) -> Array:
+    return_token: bool = False,
+) -> Array | tuple[Array, NumericToken]:
     """Reciprocal pivot growth estimate min|Uii| / max|Uii| of a factorization.
 
     Computed by klu_rcond in O(n), so it is far cheaper than a probe solve. Use it
@@ -779,13 +828,18 @@ def rcond(
     rather than off the token, so keep it in sync with what numeric.Ax was
     factored with. A mismatch calls the wrong entry point.
 
+    With return_token=True this also returns a NumericToken that a later refactor can
+    wait on, so the read is ordered before an in-place write to the same slot. See
+    refactor for why that edge matters.
+
     Args:
         symbolic: [SymbolToken|Array]: the symbolic analysis handle
         numeric: [NumericToken]: the numeric factorization handle
         dtype: the dtype the factorization was built with (float64 or complex128)
+        return_token: also return the ordering token
 
     Returns:
-        rcond: [n_lhs; float64]
+        rcond: [n_lhs; float64], or (rcond, numeric) when return_token is set
 
     """
     _require_x64()
@@ -793,7 +847,7 @@ def rcond(
     sym_h = getattr(symbolic, "handle", symbolic)
     is_complex = jnp.dtype(dtype) in COMPLEX_DTYPES
     # The numeric token carries the matrix so an evicted factorization rebuilds.
-    return cast("Any", _rcond_jit)(
+    result = cast("Any", _rcond_jit)(
         numeric.Ai,
         numeric.Aj,
         numeric.Ax,
@@ -802,6 +856,9 @@ def rcond(
         is_complex=is_complex,
         n_col=_n_col_of(numeric),
     )
+    if return_token:
+        return result, _ordered_token(numeric, result)
+    return result
 
 
 @partial(jax.jit, static_argnames=("n_col",))
@@ -822,7 +879,9 @@ def condest(
     Ax: Array,
     symbolic: SymbolToken | Array,
     numeric: NumericToken | Array,
-) -> Array:
+    *,
+    return_token: bool = False,
+) -> Array | tuple[Array, NumericToken]:
     """1-norm condition number estimate of A, given its factorization.
 
     Uses klu_condest, which applies Hager's method as modified by Higham and
@@ -830,23 +889,31 @@ def condest(
     than rcond(), so the usual pattern is to reach for it only when rcond() is
     borderline. A singular factorization gives infinity.
 
+    With return_token=True this also returns a NumericToken that a later refactor can
+    wait on, so the read is ordered before an in-place write to the same slot. This
+    needs the NumericToken from factor()/refactor(), not a raw handle.
+
     Args:
         Ai: [n_nz; int32]: the row indices of the sparse matrix A
         Aj: [n_nz; int32]: the column indices of the sparse matrix A
         Ax: [n_lhs? x n_nz; float64|complex128]: the values of the sparse matrix A
         symbolic: [SymbolToken|Array]: the symbolic analysis handle
         numeric: [NumericToken|Array]: the numeric factorization of A
+        return_token: also return the ordering token
 
     Returns:
-        condest: [n_lhs; float64]
+        condest: [n_lhs; float64], or (condest, numeric) when return_token is set
 
     """
     _require_x64()
     num_h = getattr(numeric, "handle", numeric)
     sym_h = getattr(symbolic, "handle", symbolic)
-    return cast("Any", _condest_jit)(
+    result = cast("Any", _condest_jit)(
         Ai, Aj, Ax, sym_h, num_h, n_col=_n_col_of(symbolic)
     )
+    if return_token:
+        return result, _ordered_token(numeric, result)
+    return result
 
 
 @jax.jit
@@ -872,22 +939,33 @@ def solve_with_numeric(
     numeric: NumericToken,
     b: Array,
     symbolic: SymbolToken | Array,
-) -> Array:
+    *,
+    return_token: bool = False,
+) -> Array | tuple[Array, NumericToken]:
     """Solve Ax=b using a pre-computed numeric factorization.
+
+    With return_token=True this also returns a NumericToken that a later refactor can
+    wait on. Threading it keeps the solve ordered before an in-place write to the
+    same slot, which a bare handle cannot do because the write has nothing from the
+    read to depend on. See refactor for why that edge matters.
 
     Args:
         numeric: [NumericToken]: the numeric factorization handle
         b:  [n_lhs? x n_col x n_rhs?; float64|complex128]: the target vector
         symbolic: [SymbolToken|Array]: the symbolic analysis handle
+        return_token: also return the ordering token
 
     Returns:
-        x: the result (x≈A^-1b)
+        x: the result (x≈A^-1b), or (x, numeric) when return_token is set
 
     """
     _require_x64()
     num_h = getattr(numeric, "handle", numeric)
     sym_h = getattr(symbolic, "handle", symbolic)
-    return _solve_with_numeric_jit(numeric.Ai, numeric.Aj, numeric.Ax, sym_h, num_h, b)
+    x = _solve_with_numeric_jit(numeric.Ai, numeric.Aj, numeric.Ax, sym_h, num_h, b)
+    if return_token:
+        return x, _ordered_token(numeric, x)
+    return x
 
 
 @jax.jit
@@ -911,7 +989,9 @@ def tsolve_with_numeric(
     numeric: NumericToken,
     b: Array,
     symbolic: SymbolToken | Array,
-) -> Array:
+    *,
+    return_token: bool = False,
+) -> Array | tuple[Array, NumericToken]:
     """Solve A^T x=b (transpose solve) using a pre-computed numeric factorization.
 
     Uses klu_tsolve internally. The numeric factorization must have been computed
@@ -919,32 +999,40 @@ def tsolve_with_numeric(
 
     For complex matrices, this solves A^T x = b (plain transpose, not conjugate).
 
+    With return_token=True this also returns a NumericToken that a later refactor can
+    wait on, so the solve is ordered before an in-place write to the same slot. See
+    solve_with_numeric and refactor.
+
     Args:
         numeric: [NumericToken]: the numeric factorization handle
         b:  [n_lhs? x n_col x n_rhs?; float64|complex128]: the target vector
         symbolic: [SymbolToken|Array]: the symbolic analysis handle
+        return_token: also return the ordering token
 
     Returns:
-        x: the result (x≈(A^T)^-1 b)
+        x: the result (x≈(A^T)^-1 b), or (x, numeric) when return_token is set
 
     """
     _require_x64()
     num_h = getattr(numeric, "handle", numeric)
     sym_h = getattr(symbolic, "handle", symbolic)
-    return _tsolve_with_numeric_jit(numeric.Ai, numeric.Aj, numeric.Ax, sym_h, num_h, b)
+    x = _tsolve_with_numeric_jit(numeric.Ai, numeric.Aj, numeric.Ax, sym_h, num_h, b)
+    if return_token:
+        return x, _ordered_token(numeric, x)
+    return x
 
 
 @jax.jit
 def _refactor_and_solve_jit(
     Ai: Array, Aj: Array, Ax: Array, b: Array, sym_h: Array, num_h: Array
-) -> tuple[Array, Array]:
+) -> tuple[Array, Array, Array]:
     # Use validate_numeric_solve to standardize shapes and get the expected out_shape
     Ai, Aj, Ax, b, out_shape = validate_numeric_solve(Ai, Aj, Ax, b)
 
     is_complex = any(x.dtype in COMPLEX_DTYPES for x in (Ax, b))
     prim = refactor_and_solve_c128 if is_complex else refactor_and_solve_f64
 
-    x, out_num = prim.bind(
+    x, out_num, version = prim.bind(
         Ai.astype(jnp.int32),
         Aj.astype(jnp.int32),
         Ax.astype(jnp.complex128 if is_complex else jnp.float64),
@@ -954,7 +1042,7 @@ def _refactor_and_solve_jit(
     )
 
     # Reshape x back to the original dimensions of b
-    return x.reshape(*out_shape), out_num
+    return x.reshape(*out_shape), out_num, version
 
 
 def refactor_and_solve(
@@ -993,14 +1081,16 @@ def refactor_and_solve(
     n_col = _n_col_of(symbolic)
     Ai = jnp.asarray(Ai, dtype=jnp.int32)
     Aj = jnp.asarray(Aj, dtype=jnp.int32)
-    x, out_id = _refactor_and_solve_jit(Ai, Aj, Ax, b, sym_h, num_h)
-    return x, NumericToken(out_id, Ai, Aj, _as_batched_values(Ax), n_col, _ZERO_DEPS)
+    x, out_id, version = _refactor_and_solve_jit(Ai, Aj, Ax, b, sym_h, num_h)
+    return x, NumericToken(
+        out_id, Ai, Aj, _as_batched_values(Ax), n_col, _ZERO_DEPS, version
+    )
 
 
 @jax.jit
 def _refactor_and_solve_with_status_jit(
     Ai: Array, Aj: Array, Ax: Array, b: Array, sym_h: Array, num_h: Array
-) -> tuple[Array, Array, Array]:
+) -> tuple[Array, Array, Array, Array]:
     Ai, Aj, Ax, b, out_shape = validate_numeric_solve(Ai, Aj, Ax, b)
 
     is_complex = any(x.dtype in COMPLEX_DTYPES for x in (Ax, b))
@@ -1008,7 +1098,7 @@ def _refactor_and_solve_with_status_jit(
         refactor_and_solve_status_c128 if is_complex else refactor_and_solve_status_f64
     )
 
-    x, out_num, status = prim.bind(
+    x, out_num, version, status = prim.bind(
         Ai.astype(jnp.int32),
         Aj.astype(jnp.int32),
         Ax.astype(jnp.complex128 if is_complex else jnp.float64),
@@ -1017,7 +1107,7 @@ def _refactor_and_solve_with_status_jit(
         num_h.astype(jnp.uint64),
     )
 
-    return x.reshape(*out_shape), out_num, status
+    return x.reshape(*out_shape), out_num, version, status
 
 
 def refactor_and_solve_with_status(
@@ -1056,8 +1146,12 @@ def refactor_and_solve_with_status(
     n_col = _n_col_of(symbolic)
     Ai = jnp.asarray(Ai, dtype=jnp.int32)
     Aj = jnp.asarray(Aj, dtype=jnp.int32)
-    x, out_id, status = _refactor_and_solve_with_status_jit(Ai, Aj, Ax, b, sym_h, num_h)
-    token = NumericToken(out_id, Ai, Aj, _as_batched_values(Ax), n_col, _ZERO_DEPS)
+    x, out_id, version, status = _refactor_and_solve_with_status_jit(
+        Ai, Aj, Ax, b, sym_h, num_h
+    )
+    token = NumericToken(
+        out_id, Ai, Aj, _as_batched_values(Ax), n_col, _ZERO_DEPS, version
+    )
     return x, token, status
 
 
@@ -1075,6 +1169,9 @@ tsolve_with_symbol_c128 = jax.extend.core.Primitive("tsolve_with_symbol_c128")
 free_symbolic_p = jax.extend.core.Primitive("free_symbolic")
 factor_f64 = jax.extend.core.Primitive("factor_f64")
 factor_c128 = jax.extend.core.Primitive("factor_c128")
+factor_f64.multiple_results = True
+factor_c128.multiple_results = True
+order_after_p = jax.extend.core.Primitive("order_after")
 solve_with_numeric_f64 = jax.extend.core.Primitive("solve_with_numeric_f64")
 solve_with_numeric_c128 = jax.extend.core.Primitive("solve_with_numeric_c128")
 tsolve_with_numeric_f64 = jax.extend.core.Primitive("tsolve_with_numeric_f64")
@@ -1082,6 +1179,8 @@ tsolve_with_numeric_c128 = jax.extend.core.Primitive("tsolve_with_numeric_c128")
 free_numeric_p = jax.extend.core.Primitive("free_numeric")
 refactor_f64 = jax.extend.core.Primitive("refactor_f64")
 refactor_c128 = jax.extend.core.Primitive("refactor_c128")
+refactor_f64.multiple_results = True
+refactor_c128.multiple_results = True
 refactor_and_solve_f64 = jax.extend.core.Primitive("refactor_and_solve_f64")
 refactor_and_solve_c128 = jax.extend.core.Primitive("refactor_and_solve_c128")
 refactor_and_solve_f64.multiple_results = True
@@ -1173,17 +1272,31 @@ def analyze_impl(Ai: Array, Aj: Array, n_col: Array) -> Array:
     return jax.ffi.ffi_call("analyze", ShapedArray((), jnp.uint64))(Ai, Aj, n_col)
 
 
+# factor and refactor now also return a per-slot version, so the token knows
+# which write produced it. See NumericToken and order_after.
 @factor_f64.def_impl
 def factor_f64_impl(Ai, Aj, Ax, symbolic, *, n_col):
     n_lhs = Ax.shape[0]
-    call = jax.ffi.ffi_call("factor_f64", jax.ShapeDtypeStruct((n_lhs,), jnp.uint64))
+    call = jax.ffi.ffi_call(
+        "factor_f64",
+        (
+            jax.ShapeDtypeStruct((n_lhs,), jnp.uint64),
+            jax.ShapeDtypeStruct((n_lhs,), jnp.uint64),
+        ),
+    )
     return call(Ai, Aj, Ax, symbolic, n_col=np.int64(n_col))
 
 
 @factor_c128.def_impl
 def factor_c128_impl(Ai, Aj, Ax, symbolic, *, n_col):
     n_lhs = Ax.shape[0]
-    call = jax.ffi.ffi_call("factor_c128", jax.ShapeDtypeStruct((n_lhs,), jnp.uint64))
+    call = jax.ffi.ffi_call(
+        "factor_c128",
+        (
+            jax.ShapeDtypeStruct((n_lhs,), jnp.uint64),
+            jax.ShapeDtypeStruct((n_lhs,), jnp.uint64),
+        ),
+    )
     return call(Ai, Aj, Ax, symbolic, n_col=np.int64(n_col))
 
 
@@ -1192,7 +1305,10 @@ def refactor_f64_impl(Ai, Aj, Ax, symbolic, numeric, *, n_col):
     n_lhs = Ax.shape[0]
     call = jax.ffi.ffi_call(
         "refactor_f64",
-        jax.ShapeDtypeStruct((n_lhs,), jnp.uint64),
+        (
+            jax.ShapeDtypeStruct((n_lhs,), jnp.uint64),
+            jax.ShapeDtypeStruct((n_lhs,), jnp.uint64),
+        ),
         has_side_effect=True,
     )
     return call(Ai, Aj, Ax, symbolic, numeric, n_col=np.int64(n_col))
@@ -1203,7 +1319,10 @@ def refactor_c128_impl(Ai, Aj, Ax, symbolic, numeric, *, n_col):
     n_lhs = Ax.shape[0]
     call = jax.ffi.ffi_call(
         "refactor_c128",
-        jax.ShapeDtypeStruct((n_lhs,), jnp.uint64),
+        (
+            jax.ShapeDtypeStruct((n_lhs,), jnp.uint64),
+            jax.ShapeDtypeStruct((n_lhs,), jnp.uint64),
+        ),
         has_side_effect=True,
     )
     return call(Ai, Aj, Ax, symbolic, numeric, n_col=np.int64(n_col))
@@ -1215,6 +1334,7 @@ def refactor_status_f64_impl(Ai, Aj, Ax, symbolic, numeric, *, n_col):
     call = jax.ffi.ffi_call(
         "refactor_status_f64",
         (
+            jax.ShapeDtypeStruct((n_lhs,), jnp.uint64),
             jax.ShapeDtypeStruct((n_lhs,), jnp.uint64),
             jax.ShapeDtypeStruct((n_lhs,), jnp.int32),
         ),
@@ -1229,6 +1349,7 @@ def refactor_status_c128_impl(Ai, Aj, Ax, symbolic, numeric, *, n_col):
     call = jax.ffi.ffi_call(
         "refactor_status_c128",
         (
+            jax.ShapeDtypeStruct((n_lhs,), jnp.uint64),
             jax.ShapeDtypeStruct((n_lhs,), jnp.uint64),
             jax.ShapeDtypeStruct((n_lhs,), jnp.int32),
         ),
@@ -1300,6 +1421,14 @@ def tsolve_with_numeric_c128_impl(Ai, Aj, Ax, symbolic, numeric, b):
     return call(Ai, Aj, Ax, symbolic, numeric, b)
 
 
+@order_after_p.def_impl
+def order_after_impl(numeric, version, result):
+    call = jax.ffi.ffi_call(
+        "order_after", jax.ShapeDtypeStruct(numeric.shape, jnp.uint64)
+    )
+    return call(numeric, version, result)
+
+
 @refactor_and_solve_f64.def_impl
 def refactor_and_solve_f64_impl(Ai, Aj, Ax, b, symbolic, numeric):
     n_lhs = Ax.shape[0]
@@ -1307,6 +1436,7 @@ def refactor_and_solve_f64_impl(Ai, Aj, Ax, b, symbolic, numeric):
         "refactor_and_solve_f64",
         (
             jax.ShapeDtypeStruct(b.shape, b.dtype),
+            jax.ShapeDtypeStruct((n_lhs,), jnp.uint64),
             jax.ShapeDtypeStruct((n_lhs,), jnp.uint64),
         ),
     )
@@ -1321,6 +1451,7 @@ def refactor_and_solve_c128_impl(Ai, Aj, Ax, b, symbolic, numeric):
         (
             jax.ShapeDtypeStruct(b.shape, b.dtype),
             jax.ShapeDtypeStruct((n_lhs,), jnp.uint64),
+            jax.ShapeDtypeStruct((n_lhs,), jnp.uint64),
         ),
     )
     return call(Ai, Aj, Ax, b, symbolic, numeric)
@@ -1333,6 +1464,7 @@ def refactor_and_solve_status_f64_impl(Ai, Aj, Ax, b, symbolic, numeric):
         "refactor_and_solve_status_f64",
         (
             jax.ShapeDtypeStruct(b.shape, b.dtype),
+            jax.ShapeDtypeStruct((n_lhs,), jnp.uint64),
             jax.ShapeDtypeStruct((n_lhs,), jnp.uint64),
             jax.ShapeDtypeStruct((n_lhs,), jnp.int32),
         ),
@@ -1347,6 +1479,7 @@ def refactor_and_solve_status_c128_impl(Ai, Aj, Ax, b, symbolic, numeric):
         "refactor_and_solve_status_c128",
         (
             jax.ShapeDtypeStruct(b.shape, b.dtype),
+            jax.ShapeDtypeStruct((n_lhs,), jnp.uint64),
             jax.ShapeDtypeStruct((n_lhs,), jnp.uint64),
             jax.ShapeDtypeStruct((n_lhs,), jnp.int32),
         ),
@@ -1493,20 +1626,24 @@ def free_numeric_abstract_eval(numeric, ordering):
 
 
 jax.ffi.register_ffi_target("factor_f64", klujax_cpp.factor_f64(), platform="cpu")
-factor_f64_low = mlir.lower_fun(factor_f64_impl, multiple_results=False)
+factor_f64_low = mlir.lower_fun(factor_f64_impl, multiple_results=True)
 mlir.register_lowering(factor_f64, factor_f64_low)
 
 jax.ffi.register_ffi_target("factor_c128", klujax_cpp.factor_c128(), platform="cpu")
-factor_c128_low = mlir.lower_fun(factor_c128_impl, multiple_results=False)
+factor_c128_low = mlir.lower_fun(factor_c128_impl, multiple_results=True)
 mlir.register_lowering(factor_c128, factor_c128_low)
 
 jax.ffi.register_ffi_target("refactor_f64", klujax_cpp.refactor_f64(), platform="cpu")
-refactor_f64_low = mlir.lower_fun(refactor_f64_impl, multiple_results=False)
+refactor_f64_low = mlir.lower_fun(refactor_f64_impl, multiple_results=True)
 mlir.register_lowering(refactor_f64, refactor_f64_low)
 
 jax.ffi.register_ffi_target("refactor_c128", klujax_cpp.refactor_c128(), platform="cpu")
-refactor_c128_low = mlir.lower_fun(refactor_c128_impl, multiple_results=False)
+refactor_c128_low = mlir.lower_fun(refactor_c128_impl, multiple_results=True)
 mlir.register_lowering(refactor_c128, refactor_c128_low)
+
+jax.ffi.register_ffi_target("order_after", klujax_cpp.order_after(), platform="cpu")
+order_after_low = mlir.lower_fun(order_after_impl, multiple_results=False)
+mlir.register_lowering(order_after_p, order_after_low)
 
 jax.ffi.register_ffi_target(
     "solve_with_numeric_f64", klujax_cpp.solve_with_numeric_f64(), platform="cpu"
@@ -1648,13 +1785,27 @@ def free_symbolic_abstract_eval(
 @factor_f64.def_abstract_eval
 @factor_c128.def_abstract_eval
 def factor_abstract_eval(Ai, Aj, Ax, symbolic, *, n_col):
-    return ShapedArray((Ax.shape[0],), jnp.uint64)
+    # Returns the numeric id and the version stamped on it, one per left-hand side.
+    return (
+        ShapedArray((Ax.shape[0],), jnp.uint64),
+        ShapedArray((Ax.shape[0],), jnp.uint64),
+    )
 
 
 @refactor_f64.def_abstract_eval
 @refactor_c128.def_abstract_eval
 def refactor_abstract_eval(Ai, Aj, Ax, symbolic, numeric, *, n_col):
-    return ShapedArray((Ax.shape[0],), jnp.uint64)
+    # Returns the same id back and the fresh version, one per left-hand side.
+    return (
+        ShapedArray((Ax.shape[0],), jnp.uint64),
+        ShapedArray((Ax.shape[0],), jnp.uint64),
+    )
+
+
+@order_after_p.def_abstract_eval
+def order_after_abstract_eval(numeric, version, result):
+    # Passes the numeric id straight through, so its shape is unchanged.
+    return ShapedArray(numeric.shape, jnp.uint64)
 
 
 @solve_with_numeric_f64.def_abstract_eval
@@ -1669,15 +1820,20 @@ def solve_with_numeric_abstract_eval(Ai, Aj, Ax, symbolic, numeric, b):
 @refactor_and_solve_f64.def_abstract_eval
 @refactor_and_solve_c128.def_abstract_eval
 def refactor_and_solve_abstract_eval(Ai, Aj, Ax, b, symbolic, numeric):
-    # Returns (x with same shape as b, out_numeric with same shape as numeric)
-    return ShapedArray(b.shape, b.dtype), ShapedArray(numeric.shape, jnp.uint64)
+    # Returns x (shape of b), the same numeric id, and the fresh version.
+    return (
+        ShapedArray(b.shape, b.dtype),
+        ShapedArray(numeric.shape, jnp.uint64),
+        ShapedArray(numeric.shape, jnp.uint64),
+    )
 
 
 @refactor_status_f64.def_abstract_eval
 @refactor_status_c128.def_abstract_eval
 def refactor_status_abstract_eval(Ai, Aj, Ax, symbolic, numeric, *, n_col):
-    # As refactor, plus one KLU status code per left-hand side
+    # As refactor (id and version), plus one KLU status code per left-hand side.
     return (
+        ShapedArray((Ax.shape[0],), jnp.uint64),
         ShapedArray((Ax.shape[0],), jnp.uint64),
         ShapedArray((Ax.shape[0],), jnp.int32),
     )
@@ -1688,6 +1844,7 @@ def refactor_status_abstract_eval(Ai, Aj, Ax, symbolic, numeric, *, n_col):
 def refactor_and_solve_status_abstract_eval(Ai, Aj, Ax, b, symbolic, numeric):
     return (
         ShapedArray(b.shape, b.dtype),
+        ShapedArray(numeric.shape, jnp.uint64),
         ShapedArray(numeric.shape, jnp.uint64),
         ShapedArray((Ax.shape[0],), jnp.int32),
     )
@@ -1922,14 +2079,14 @@ batching.primitive_batchers[factor_c128] = factor_c128_vmap
 
 
 def refactor_f64_vmap(vals, axes, **params: object):
-    return general_vmap_refactor(refactor_f64, vals, axes, **params)
+    return general_vmap_refactor_pair(refactor_f64, vals, axes, **params)
 
 
 batching.primitive_batchers[refactor_f64] = refactor_f64_vmap
 
 
 def refactor_c128_vmap(vals, axes, **params: object):
-    return general_vmap_refactor(refactor_c128, vals, axes, **params)
+    return general_vmap_refactor_pair(refactor_c128, vals, axes, **params)
 
 
 batching.primitive_batchers[refactor_c128] = refactor_c128_vmap
@@ -2197,9 +2354,11 @@ def general_vmap_factor(
         Ax = jnp.moveaxis(Ax, aAx, 0)
         batch, n_lhs, n_vals = Ax.shape
         Ax = Ax.reshape(batch * n_lhs, n_vals)
-        return prim.bind(
+        # factor returns the id and the version, both per left-hand side.
+        numeric, version = prim.bind(
             Ai.astype(jnp.int32), Aj.astype(jnp.int32), Ax, symbolic, **params
-        ).reshape(batch, n_lhs), 0
+        )
+        return (numeric.reshape(batch, n_lhs), version.reshape(batch, n_lhs)), (0, 0)
 
     msg = "vmap failed. Please select an axis to vectorize over."
     raise ValueError(msg)
@@ -2272,8 +2431,21 @@ def general_vmap_refactor(
     batch_axes: tuple[int | None, int | None, int | None, int | None, int | None],
     **params: Any,  # noqa: ANN401
 ) -> tuple[Array, int]:
+    # For the single-output reads that share refactor's argument shape (rcond, condest).
     args, shape = _flatten_refactor_batch(vector_arg_values, batch_axes)
     return prim.bind(*args, **params).reshape(*shape), 0
+
+
+def general_vmap_refactor_pair(
+    prim: jax.extend.core.Primitive,
+    vector_arg_values: tuple[Array, Array, Array, Array, Array],
+    batch_axes: tuple[int | None, int | None, int | None, int | None, int | None],
+    **params: Any,  # noqa: ANN401
+) -> tuple[tuple[Array, Array], tuple[int, int]]:
+    # refactor returns the id and the version, both batched along the same axis.
+    args, shape = _flatten_refactor_batch(vector_arg_values, batch_axes)
+    numeric, version = prim.bind(*args, **params)
+    return (numeric.reshape(*shape), version.reshape(*shape)), (0, 0)
 
 
 def general_vmap_refactor_status(
@@ -2281,11 +2453,46 @@ def general_vmap_refactor_status(
     vector_arg_values: tuple[Array, Array, Array, Array, Array],
     batch_axes: tuple[int | None, int | None, int | None, int | None, int | None],
     **params: Any,  # noqa: ANN401
-) -> tuple[tuple[Array, Array], tuple[int, int]]:
-    # As general_vmap_refactor, but the status output is batched along the same axis.
+) -> tuple[tuple[Array, Array, Array], tuple[int, int, int]]:
+    # As general_vmap_refactor_pair, plus the status output on the same axis.
     args, shape = _flatten_refactor_batch(vector_arg_values, batch_axes)
-    numeric, status = prim.bind(*args, **params)
-    return (numeric.reshape(*shape), status.reshape(*shape)), (0, 0)
+    numeric, version, status = prim.bind(*args, **params)
+    return (
+        (numeric.reshape(*shape), version.reshape(*shape), status.reshape(*shape)),
+        (0, 0, 0),
+    )
+
+
+def order_after_p_vmap(
+    vector_arg_values: tuple[Array, Array, Array],
+    batch_axes: tuple[int | None, int | None, int | None],
+) -> tuple[Array, int]:
+    # Run one id per batch element. The op is a cheap passthrough, so a
+    # sequential map keeps it correct without a bespoke batching rule.
+    out = jax.vmap(
+        jax.custom_batching.sequential_vmap(order_after_p.bind), in_axes=batch_axes
+    )(*vector_arg_values)
+    return out, 0
+
+
+batching.primitive_batchers[order_after_p] = order_after_p_vmap
+
+
+def order_after_value_and_jvp(
+    primals: tuple[Array, Array, Array], tangents: tuple[Any, Any, Any]
+) -> tuple[Array, Any]:
+    """Forward rule for `order_after`.
+
+    The output is an integer id, so it never carries a gradient. The result input
+    is here only for ordering, so its tangent is dropped and the output tangent is
+    zero. This keeps the id in the primal computation under `grad`, so threading a
+    token through a differentiated read does not drag it into the tangent graph.
+    """
+    out = order_after_p.bind(*primals)
+    return out, ad.Zero(out.aval.to_tangent_aval())
+
+
+ad.primitive_jvps[order_after_p] = order_after_value_and_jvp
 
 
 def free_numeric_p_vmap(

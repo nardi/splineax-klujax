@@ -227,6 +227,10 @@ struct SymbolicObj {
 struct CacheEntry {
     std::shared_ptr<SymbolicObj> symbolic;  // always set
     klu_numeric* numeric = nullptr;         // null for a symbolic-only entry
+    // Bumped by every write (factor/refactor) that changes this slot's contents.
+    // A read carries the version it expects and `order_after` flags a mismatch,
+    // so a token used after the slot was overwritten is caught. 0 means unstamped.
+    uint64_t version = 0;
     ~CacheEntry() {
         if (numeric) {
             klu_common c;
@@ -243,6 +247,7 @@ struct CacheRegistry {
     std::map<uint64_t, std::shared_ptr<CacheEntry>> entries;
     std::list<uint64_t> lru;  // front = most recently used
     std::atomic<uint64_t> next_id{1};
+    std::atomic<uint64_t> next_version{1};
     std::atomic<long> rebuilds{0};
 
     static CacheRegistry& instance() {
@@ -274,6 +279,10 @@ struct CacheRegistry {
             id = next_id.fetch_add(1);
         } while (id == 0 || entries.count(id));
         return id;
+    }
+    // A globally unique, monotonic version stamped on a slot by each write.
+    uint64_t fresh_version() {
+        return next_version.fetch_add(1);
     }
     void touch(uint64_t id) {
         lru.remove(id);
@@ -913,7 +922,8 @@ ffi::Error factor_impl(
     const ffi::AnyBuffer::Dimensions& ds_Ax,
     const ffi::Buffer<ffi::DataType::U64>& symbolic,
     const T* _Ax,
-    uint64_t* _numeric) {
+    uint64_t* _numeric,
+    uint64_t* _out_version) {
     if (symbolic.element_count() != 1) return ffi::Error::InvalidArgument("symbolic must be scalar");
     uint64_t sym_id = *symbolic.typed_data();
 
@@ -946,6 +956,10 @@ ffi::Error factor_impl(
         auto entry = std::make_shared<CacheEntry>();
         entry->symbolic = sym;
         entry->numeric = Numeric;
+        // Stamp a fresh version so a later read can tell this factorization
+        // apart from whatever a refactor writes into the same slot.
+        entry->version = registry.fresh_version();
+        _out_version[i] = entry->version;
         _numeric[i] = registry.insert(entry);
     }
     return ffi::Error::Success();
@@ -957,8 +971,10 @@ ffi::Error factor_f64(
     const ffi::Buffer<ffi::DataType::S32> Aj,
     const ffi::Buffer<ffi::DataType::F64> Ax,
     const ffi::Buffer<ffi::DataType::U64> symbolic,
-    ffi::Result<ffi::Buffer<ffi::DataType::U64>> numeric) {
-    return factor_impl<double>(n_col, Ai, Aj, Ax.dimensions(), symbolic, Ax.typed_data(), numeric->typed_data());
+    ffi::Result<ffi::Buffer<ffi::DataType::U64>> numeric,
+    ffi::Result<ffi::Buffer<ffi::DataType::U64>> version) {
+    return factor_impl<double>(n_col, Ai, Aj, Ax.dimensions(), symbolic, Ax.typed_data(),
+                               numeric->typed_data(), version->typed_data());
 }
 
 ffi::Error factor_c128(
@@ -967,10 +983,11 @@ ffi::Error factor_c128(
     const ffi::Buffer<ffi::DataType::S32> Aj,
     const ffi::Buffer<ffi::DataType::C128> Ax,
     const ffi::Buffer<ffi::DataType::U64> symbolic,
-    ffi::Result<ffi::Buffer<ffi::DataType::U64>> numeric) {
+    ffi::Result<ffi::Buffer<ffi::DataType::U64>> numeric,
+    ffi::Result<ffi::Buffer<ffi::DataType::U64>> version) {
     return factor_impl<Complex>(n_col, Ai, Aj, Ax.dimensions(), symbolic,
                                 reinterpret_cast<const Complex*>(Ax.typed_data()),
-                                numeric->typed_data());
+                                numeric->typed_data(), version->typed_data());
 }
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
@@ -981,7 +998,8 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<ffi::Buffer<ffi::DataType::S32>>()
         .Arg<ffi::Buffer<ffi::DataType::F64>>()
         .Arg<ffi::Buffer<ffi::DataType::U64>>()
-        .Ret<ffi::Buffer<ffi::DataType::U64>>());
+        .Ret<ffi::Buffer<ffi::DataType::U64>>()   // numeric
+        .Ret<ffi::Buffer<ffi::DataType::U64>>());  // version
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     factor_c128_handler, factor_c128,
@@ -991,7 +1009,8 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<ffi::Buffer<ffi::DataType::S32>>()
         .Arg<ffi::Buffer<ffi::DataType::C128>>()
         .Arg<ffi::Buffer<ffi::DataType::U64>>()
-        .Ret<ffi::Buffer<ffi::DataType::U64>>());
+        .Ret<ffi::Buffer<ffi::DataType::U64>>()   // numeric
+        .Ret<ffi::Buffer<ffi::DataType::U64>>());  // version
 
 // Shared by refactor and refactor_status. With `_out_status == nullptr` a failed refactor
 // aborts the call with an FFI error (the original refactor behaviour). Otherwise the KLU
@@ -1008,6 +1027,7 @@ ffi::Error refactor_impl(
     const ffi::Buffer<ffi::DataType::U64>& numeric,
     const T* _Ax,
     uint64_t* _out_numeric,
+    uint64_t* _out_version,
     int32_t* _out_status = nullptr) {
     (void)symbolic;  // numeric handle is self-contained, uses its own analysis
 
@@ -1060,6 +1080,10 @@ ffi::Error refactor_impl(
         }
         // Same id back out, so XLA sees the data edge refactor -> solve.
         _out_numeric[i] = _numeric[i];
+        // The slot now holds new values, so give it a fresh version. A read
+        // still carrying the old version is then flagged by `order_after`.
+        entry->version = CacheRegistry::instance().fresh_version();
+        _out_version[i] = entry->version;
     }
     return ffi::Error::Success();
 }
@@ -1071,8 +1095,10 @@ ffi::Error refactor_f64(
     const ffi::Buffer<ffi::DataType::F64> Ax,
     const ffi::Buffer<ffi::DataType::U64> symbolic,
     const ffi::Buffer<ffi::DataType::U64> numeric,
-    ffi::Result<ffi::Buffer<ffi::DataType::U64>> out_numeric) {
-    return refactor_impl<double>(n_col, Ai, Aj, Ax.dimensions(), symbolic, numeric, Ax.typed_data(), out_numeric->typed_data());
+    ffi::Result<ffi::Buffer<ffi::DataType::U64>> out_numeric,
+    ffi::Result<ffi::Buffer<ffi::DataType::U64>> out_version) {
+    return refactor_impl<double>(n_col, Ai, Aj, Ax.dimensions(), symbolic, numeric, Ax.typed_data(),
+                                 out_numeric->typed_data(), out_version->typed_data());
 }
 
 ffi::Error refactor_c128(
@@ -1082,10 +1108,11 @@ ffi::Error refactor_c128(
     const ffi::Buffer<ffi::DataType::C128> Ax,
     const ffi::Buffer<ffi::DataType::U64> symbolic,
     const ffi::Buffer<ffi::DataType::U64> numeric,
-    ffi::Result<ffi::Buffer<ffi::DataType::U64>> out_numeric) {
+    ffi::Result<ffi::Buffer<ffi::DataType::U64>> out_numeric,
+    ffi::Result<ffi::Buffer<ffi::DataType::U64>> out_version) {
     return refactor_impl<Complex>(n_col, Ai, Aj, Ax.dimensions(), symbolic, numeric,
                                   reinterpret_cast<const Complex*>(Ax.typed_data()),
-                                  out_numeric->typed_data());
+                                  out_numeric->typed_data(), out_version->typed_data());
 }
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
@@ -1098,6 +1125,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<ffi::Buffer<ffi::DataType::U64>>()  // symbolic
         .Arg<ffi::Buffer<ffi::DataType::U64>>()  // numeric (input handles)
         .Ret<ffi::Buffer<ffi::DataType::U64>>()  // out_numeric (same handles, for XLA dep edge)
+        .Ret<ffi::Buffer<ffi::DataType::U64>>()  // out_version (fresh version per slot)
 );
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
@@ -1110,6 +1138,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<ffi::Buffer<ffi::DataType::U64>>()   // symbolic
         .Arg<ffi::Buffer<ffi::DataType::U64>>()   // numeric (input handles)
         .Ret<ffi::Buffer<ffi::DataType::U64>>()   // out_numeric (same handles, for XLA dep edge)
+        .Ret<ffi::Buffer<ffi::DataType::U64>>()   // out_version (fresh version per slot)
 );
 
 // refactor_status: same as refactor, but reports the KLU status per batch element instead
@@ -1122,9 +1151,11 @@ ffi::Error refactor_status_f64(
     const ffi::Buffer<ffi::DataType::U64> symbolic,
     const ffi::Buffer<ffi::DataType::U64> numeric,
     ffi::Result<ffi::Buffer<ffi::DataType::U64>> out_numeric,
+    ffi::Result<ffi::Buffer<ffi::DataType::U64>> out_version,
     ffi::Result<ffi::Buffer<ffi::DataType::S32>> out_status) {
     return refactor_impl<double>(n_col, Ai, Aj, Ax.dimensions(), symbolic, numeric, Ax.typed_data(),
-                                 out_numeric->typed_data(), out_status->typed_data());
+                                 out_numeric->typed_data(), out_version->typed_data(),
+                                 out_status->typed_data());
 }
 
 ffi::Error refactor_status_c128(
@@ -1135,10 +1166,12 @@ ffi::Error refactor_status_c128(
     const ffi::Buffer<ffi::DataType::U64> symbolic,
     const ffi::Buffer<ffi::DataType::U64> numeric,
     ffi::Result<ffi::Buffer<ffi::DataType::U64>> out_numeric,
+    ffi::Result<ffi::Buffer<ffi::DataType::U64>> out_version,
     ffi::Result<ffi::Buffer<ffi::DataType::S32>> out_status) {
     return refactor_impl<Complex>(n_col, Ai, Aj, Ax.dimensions(), symbolic, numeric,
                                   reinterpret_cast<const Complex*>(Ax.typed_data()),
-                                  out_numeric->typed_data(), out_status->typed_data());
+                                  out_numeric->typed_data(), out_version->typed_data(),
+                                  out_status->typed_data());
 }
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
@@ -1151,6 +1184,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<ffi::Buffer<ffi::DataType::U64>>()  // symbolic
         .Arg<ffi::Buffer<ffi::DataType::U64>>()  // numeric (input handles)
         .Ret<ffi::Buffer<ffi::DataType::U64>>()  // out_numeric (same handles, for XLA dep edge)
+        .Ret<ffi::Buffer<ffi::DataType::U64>>()  // out_version (fresh version per slot)
         .Ret<ffi::Buffer<ffi::DataType::S32>>()  // out_status (KLU status per batch element)
 );
 
@@ -1164,6 +1198,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<ffi::Buffer<ffi::DataType::U64>>()   // symbolic
         .Arg<ffi::Buffer<ffi::DataType::U64>>()   // numeric (input handles)
         .Ret<ffi::Buffer<ffi::DataType::U64>>()   // out_numeric (same handles, for XLA dep edge)
+        .Ret<ffi::Buffer<ffi::DataType::U64>>()   // out_version (fresh version per slot)
         .Ret<ffi::Buffer<ffi::DataType::S32>>()   // out_status (KLU status per batch element)
 );
 
@@ -1183,6 +1218,7 @@ ffi::Error refactor_and_solve_impl(
     const T* _b,
     T* _x,
     uint64_t* _out_numeric,
+    uint64_t* _out_version,
     int32_t* _out_status = nullptr) {
     (void)symbolic;  // numeric handle is self-contained, uses its own analysis
 
@@ -1250,6 +1286,9 @@ ffi::Error refactor_and_solve_impl(
         }
         // Same id back out on every path, for the XLA edge refactor -> solve.
         _out_numeric[i] = _numeric[i];
+        // The slot holds new values now, so stamp a fresh version on every path.
+        entry->version = CacheRegistry::instance().fresh_version();
+        _out_version[i] = entry->version;
         if (!ok || Common.status < KLU_OK) {
             fill_nan(&_x_temp[n], n_rhs * n_col);
             if (_out_status != nullptr) _out_status[i] = (int32_t)Common.status;
@@ -1283,10 +1322,12 @@ ffi::Error refactor_and_solve_f64(
     const ffi::Buffer<ffi::DataType::U64> symbolic,
     const ffi::Buffer<ffi::DataType::U64> numeric,
     ffi::Result<ffi::Buffer<ffi::DataType::F64>> x,
-    ffi::Result<ffi::Buffer<ffi::DataType::U64>> out_numeric) {
+    ffi::Result<ffi::Buffer<ffi::DataType::U64>> out_numeric,
+    ffi::Result<ffi::Buffer<ffi::DataType::U64>> out_version) {
     return refactor_and_solve_impl<double>(
         Ai, Aj, Ax.dimensions(), b.dimensions(), symbolic, numeric,
-        Ax.typed_data(), b.typed_data(), x->typed_data(), out_numeric->typed_data());
+        Ax.typed_data(), b.typed_data(), x->typed_data(), out_numeric->typed_data(),
+        out_version->typed_data());
 }
 
 ffi::Error refactor_and_solve_c128(
@@ -1297,13 +1338,14 @@ ffi::Error refactor_and_solve_c128(
     const ffi::Buffer<ffi::DataType::U64> symbolic,
     const ffi::Buffer<ffi::DataType::U64> numeric,
     ffi::Result<ffi::Buffer<ffi::DataType::C128>> x,
-    ffi::Result<ffi::Buffer<ffi::DataType::U64>> out_numeric) {
+    ffi::Result<ffi::Buffer<ffi::DataType::U64>> out_numeric,
+    ffi::Result<ffi::Buffer<ffi::DataType::U64>> out_version) {
     return refactor_and_solve_impl<Complex>(
         Ai, Aj, Ax.dimensions(), b.dimensions(), symbolic, numeric,
         reinterpret_cast<const Complex*>(Ax.typed_data()),
         reinterpret_cast<const Complex*>(b.typed_data()),
         reinterpret_cast<Complex*>(x->typed_data()),
-        out_numeric->typed_data());
+        out_numeric->typed_data(), out_version->typed_data());
 }
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
@@ -1317,6 +1359,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<ffi::Buffer<ffi::DataType::U64>>()  // numeric (input handles)
         .Ret<ffi::Buffer<ffi::DataType::F64>>()  // x (solution)
         .Ret<ffi::Buffer<ffi::DataType::U64>>()  // out_numeric (same handles, for XLA dep edge)
+        .Ret<ffi::Buffer<ffi::DataType::U64>>()  // out_version (fresh version per slot)
 );
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
@@ -1330,6 +1373,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<ffi::Buffer<ffi::DataType::U64>>()   // numeric (input handles)
         .Ret<ffi::Buffer<ffi::DataType::C128>>()  // x (solution)
         .Ret<ffi::Buffer<ffi::DataType::U64>>()   // out_numeric (same handles, for XLA dep edge)
+        .Ret<ffi::Buffer<ffi::DataType::U64>>()   // out_version (fresh version per slot)
 );
 
 // refactor_and_solve_status: as refactor_and_solve (x is still NaN-filled on failure), with
@@ -1343,11 +1387,12 @@ ffi::Error refactor_and_solve_status_f64(
     const ffi::Buffer<ffi::DataType::U64> numeric,
     ffi::Result<ffi::Buffer<ffi::DataType::F64>> x,
     ffi::Result<ffi::Buffer<ffi::DataType::U64>> out_numeric,
+    ffi::Result<ffi::Buffer<ffi::DataType::U64>> out_version,
     ffi::Result<ffi::Buffer<ffi::DataType::S32>> out_status) {
     return refactor_and_solve_impl<double>(
         Ai, Aj, Ax.dimensions(), b.dimensions(), symbolic, numeric,
         Ax.typed_data(), b.typed_data(), x->typed_data(), out_numeric->typed_data(),
-        out_status->typed_data());
+        out_version->typed_data(), out_status->typed_data());
 }
 
 ffi::Error refactor_and_solve_status_c128(
@@ -1359,13 +1404,14 @@ ffi::Error refactor_and_solve_status_c128(
     const ffi::Buffer<ffi::DataType::U64> numeric,
     ffi::Result<ffi::Buffer<ffi::DataType::C128>> x,
     ffi::Result<ffi::Buffer<ffi::DataType::U64>> out_numeric,
+    ffi::Result<ffi::Buffer<ffi::DataType::U64>> out_version,
     ffi::Result<ffi::Buffer<ffi::DataType::S32>> out_status) {
     return refactor_and_solve_impl<Complex>(
         Ai, Aj, Ax.dimensions(), b.dimensions(), symbolic, numeric,
         reinterpret_cast<const Complex*>(Ax.typed_data()),
         reinterpret_cast<const Complex*>(b.typed_data()),
         reinterpret_cast<Complex*>(x->typed_data()),
-        out_numeric->typed_data(), out_status->typed_data());
+        out_numeric->typed_data(), out_version->typed_data(), out_status->typed_data());
 }
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
@@ -1379,6 +1425,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<ffi::Buffer<ffi::DataType::U64>>()  // numeric (input handles)
         .Ret<ffi::Buffer<ffi::DataType::F64>>()  // x (solution)
         .Ret<ffi::Buffer<ffi::DataType::U64>>()  // out_numeric (same handles, for XLA dep edge)
+        .Ret<ffi::Buffer<ffi::DataType::U64>>()  // out_version (fresh version per slot)
         .Ret<ffi::Buffer<ffi::DataType::S32>>()  // out_status (KLU status per batch element)
 );
 
@@ -1393,6 +1440,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<ffi::Buffer<ffi::DataType::U64>>()   // numeric (input handles)
         .Ret<ffi::Buffer<ffi::DataType::C128>>()  // x (solution)
         .Ret<ffi::Buffer<ffi::DataType::U64>>()   // out_numeric (same handles, for XLA dep edge)
+        .Ret<ffi::Buffer<ffi::DataType::U64>>()   // out_version (fresh version per slot)
         .Ret<ffi::Buffer<ffi::DataType::S32>>()   // out_status (KLU status per batch element)
 );
 
@@ -1927,6 +1975,61 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Ret<ffi::Buffer<ffi::DataType::C128>>()  // x
 );
 
+// order_after: pass a numeric id through after a read has produced its result.
+//
+// A read (solve, rcond, ...) has no output the next write can wait on, so XLA is
+// free to run an in-place refactor before the read. This op takes the read's
+// result as an operand it does not use, so XLA orders it after the read, and
+// returns the same id for the next write to consume. That threads read and write
+// onto one chain. The result buffer is any dtype, so one handler serves them all.
+//
+// It also carries the version check: `version` is what the token expects, and a
+// mismatch against the resident slot means the slot was overwritten while the
+// token still pointed at the old contents. See NumericToken in klujax.py.
+ffi::Error order_after_impl(
+    const ffi::Buffer<ffi::DataType::U64>& numeric,
+    const ffi::Buffer<ffi::DataType::U64>& version,
+    uint64_t* _out_numeric) {
+    int n = (int)numeric.element_count();
+    int n_ver = (int)version.element_count();
+    const uint64_t* _numeric = numeric.typed_data();
+    const uint64_t* _version = version.typed_data();
+    auto& r = CacheRegistry::instance();
+    for (int i = 0; i < n; i++) {
+        _out_numeric[i] = _numeric[i];
+        uint64_t want = _version[(n_ver == 1) ? 0 : i];
+        // A zero version is unstamped, so there is nothing to check against.
+        if (want == 0) continue;
+        auto e = r.lookup(_numeric[i]);
+        if (e && e->version != 0 && e->version != want) {
+            return ffi::Error::Internal(
+                "klujax: stale numeric token (version " + std::to_string(want) +
+                " but slot holds " + std::to_string(e->version) +
+                "). The slot was overwritten by a later refactor. Thread the token "
+                "returned by the read into the refactor instead of reusing the old one.");
+        }
+    }
+    return ffi::Error::Success();
+}
+
+ffi::Error order_after(
+    const ffi::Buffer<ffi::DataType::U64> numeric,
+    const ffi::Buffer<ffi::DataType::U64> version,
+    const ffi::AnyBuffer result,
+    ffi::Result<ffi::Buffer<ffi::DataType::U64>> out_numeric) {
+    (void)result;  // Present only to order this op after the read that made it.
+    return order_after_impl(numeric, version, out_numeric->typed_data());
+}
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    order_after_handler, order_after,
+    ffi::Ffi::Bind()
+        .Arg<ffi::Buffer<ffi::DataType::U64>>()  // numeric (input handles)
+        .Arg<ffi::Buffer<ffi::DataType::U64>>()  // version (expected per slot)
+        .Arg<ffi::AnyBuffer>()                   // result (ordering edge only)
+        .Ret<ffi::Buffer<ffi::DataType::U64>>()  // out_numeric (same handles)
+);
+
 // Freeing now just drops the cache entry, which frees its KLU objects. It is
 // never required: a later use of the id rebuilds it. An unknown id is a no-op.
 // ordering is an unused operand that only gives XLA a data dependency, so a
@@ -2061,6 +2164,8 @@ PYBIND11_MODULE(klujax_cpp, m) {
           []() { return py::capsule((void*)&tsolve_with_numeric_f64_handler); });
     m.def("tsolve_with_numeric_c128",
           []() { return py::capsule((void*)&tsolve_with_numeric_c128_handler); });
+    m.def("order_after",
+          []() { return py::capsule((void*)&order_after_handler); });
     m.def("free_numeric",
           []() { return py::capsule((void*)&free_numeric_handler); });
     m.def("analyze",

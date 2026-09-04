@@ -1118,9 +1118,10 @@ def test_numeric_token_pytree_roundtrip():
     num = klujax.factor(Ai, Aj, Ax, sym)
     leaves, treedef = jax.tree_util.tree_flatten(num)
     rebuilt = treedef.unflatten(leaves)
-    assert len(leaves) == 5  # id, Ai, Aj, Ax, n_dependent_solutions
+    assert len(leaves) == 6  # id, Ai, Aj, Ax, n_dependent_solutions, version
     assert rebuilt.n_col == n_col
     assert int(rebuilt.n_dependent_solutions) == 0
+    assert int(rebuilt.version[0]) == int(num.version[0])
     klujax.free_numeric(num)
     klujax.free_symbolic(sym)
 
@@ -1411,4 +1412,167 @@ def test_many_solves_in_a_vmap_then_free():
     assert klujax.rebuild_count() == 0
     A = _dense(Ai, Aj, Ax, n_col, np.float64)
     _log_and_test_equality(jax.vmap(lambda bb: jsp.linalg.solve(A, bb))(bs), xs)
+    klujax.free_symbolic(sym)
+
+
+# Ordering tokens from reads =========================================================
+#
+# A read (solve, tsolve, rcond, condest) can hand back a NumericToken so a later
+# in-place refactor waits on the read. These tests cover the returned value, the
+# ordering under jit, the version staleness check, and grad through a threaded read.
+
+
+@log_test_name
+@parametrize_dtypes
+def test_solve_with_numeric_return_token(dtype):
+    """return_token gives back the solution and a token with the same id and version."""
+    Ai, Aj, Ax, b = _get_rand_arrs_1d(15, (n_col := 5), dtype=dtype)
+    sym = klujax.analyze(Ai, Aj, n_col)
+    num = klujax.factor(Ai, Aj, Ax, sym)
+
+    x, tok = klujax.solve_with_numeric(num, b, sym, return_token=True)
+
+    x_ref = jsp.linalg.solve(_dense(Ai, Aj, Ax, n_col, dtype), b)
+    _log_and_test_equality(x_ref, x)
+    assert int(tok.id[0]) == int(num.id[0])
+    assert int(tok.version[0]) == int(num.version[0])
+
+    x_plain = klujax.solve_with_numeric(tok, b, sym)
+    _log_and_test_equality(x_ref, x_plain)
+    klujax.free_numeric(num)
+    klujax.free_symbolic(sym)
+
+
+@log_test_name
+@parametrize_dtypes
+def test_tsolve_with_numeric_return_token(dtype):
+    """return_token on the transpose solve returns the solution and a usable token."""
+    Ai, Aj, Ax, b = _get_rand_arrs_1d(15, (n_col := 5), dtype=dtype)
+    sym = klujax.analyze(Ai, Aj, n_col)
+    num = klujax.factor(Ai, Aj, Ax, sym)
+
+    x, tok = klujax.tsolve_with_numeric(num, b, sym, return_token=True)
+
+    x_ref = jsp.linalg.solve(_dense(Ai, Aj, Ax, n_col, dtype).T, b)
+    _log_and_test_equality(x_ref, x)
+    assert int(tok.id[0]) == int(num.id[0])
+    klujax.free_numeric(num)
+    klujax.free_symbolic(sym)
+
+
+@log_test_name
+def test_rcond_condest_return_token():
+    """rcond and condest hand back a token alongside their estimate."""
+    Ai, Aj, Ax, _ = _get_rand_arrs_1d(15, (n_col := 5), dtype=np.float64)
+    sym = klujax.analyze(Ai, Aj, n_col)
+    num = klujax.factor(Ai, Aj, Ax, sym)
+
+    r, tok_r = klujax.rcond(sym, num, return_token=True)
+    r_plain = klujax.rcond(sym, num)
+    _log_and_test_equality(np.asarray(r_plain), np.asarray(r))
+    assert int(tok_r.id[0]) == int(num.id[0])
+
+    c, tok_c = klujax.condest(Ai, Aj, Ax, sym, num, return_token=True)
+    c_plain = klujax.condest(Ai, Aj, Ax, sym, num)
+    _log_and_test_equality(np.asarray(c_plain), np.asarray(c))
+    assert int(tok_c.id[0]) == int(num.id[0])
+    klujax.free_numeric(num)
+    klujax.free_symbolic(sym)
+
+
+@log_test_name
+def test_condest_return_token_needs_token():
+    """A raw handle has no arrays to build a token from, so return_token rejects it."""
+    Ai, Aj, Ax, _ = _get_rand_arrs_1d(15, (n_col := 5), dtype=np.float64)
+    sym = klujax.analyze(Ai, Aj, n_col)
+    num = klujax.factor(Ai, Aj, Ax, sym)
+    with pytest.raises(TypeError):
+        klujax.condest(Ai, Aj, Ax, sym, num.handle, return_token=True)
+    klujax.free_numeric(num)
+    klujax.free_symbolic(sym)
+
+
+@log_test_name
+@parametrize_dtypes
+def test_threaded_solve_orders_refactor(dtype):
+    """Threading the read token keeps an earlier solve correct across an in-place refactor.
+
+    factor, solve, then refactor the same slot, then solve again, all in one jit.
+    The first solve reads the first matrix and the second reads the refactored one.
+    Threading the token puts a data edge from the first solve to the refactor.
+    """
+    Ai, Aj, Ax1, b1 = _get_rand_arrs_1d(15, (n_col := 5), dtype=dtype)
+    Ax2 = _make_ax2(Ai, Aj, Ax1, dtype=dtype)
+    b2 = jax.random.normal(jax.random.PRNGKey(7), (n_col,), dtype=dtype)
+    sym = klujax.analyze(Ai, Aj, n_col)
+
+    @jax.jit
+    def run(Ax1, Ax2, b1, b2):
+        n0 = klujax.factor(Ai, Aj, Ax1, sym)
+        x1, n1 = klujax.solve_with_numeric(n0, b1, sym, return_token=True)
+        n2 = klujax.refactor(Ai, Aj, Ax2, n1, sym)
+        x2 = klujax.solve_with_numeric(n2, b2, sym)
+        return x1, x2
+
+    x1, x2 = run(Ax1, Ax2, b1, b2)
+    x1_ref = jsp.linalg.solve(_dense(Ai, Aj, Ax1, n_col, dtype), b1)
+    x2_ref = jsp.linalg.solve(_dense(Ai, Aj, Ax2, n_col, dtype), b2)
+    _log_and_test_equality(x1_ref, x1)
+    _log_and_test_equality(x2_ref, x2)
+    klujax.free_symbolic(sym)
+
+
+@log_test_name
+def test_stale_token_reports_mismatch():
+    """Reusing a token after a later refactor overwrote its slot is reported, not silent."""
+    Ai, Aj, Ax1, b = _get_rand_arrs_1d(15, (n_col := 5), dtype=np.float64)
+    Ax2 = _make_ax2(Ai, Aj, Ax1, dtype=np.float64)
+    sym = klujax.analyze(Ai, Aj, n_col)
+
+    n0 = klujax.factor(Ai, Aj, Ax1, sym)
+    _, n1 = klujax.solve_with_numeric(n0, b, sym, return_token=True)
+    klujax.refactor(Ai, Aj, Ax2, n1, sym)  # slot moves to a new version in place
+
+    with pytest.raises(Exception, match="stale"):
+        jax.block_until_ready(klujax.solve_with_numeric(n1, b, sym, return_token=True))
+    klujax.free_symbolic(sym)
+
+
+@log_test_name
+def test_return_token_grad_matches_plain():
+    """grad through a solve is unchanged by asking for the token as well."""
+    Ai, Aj, Ax, b = _get_rand_arrs_1d(15, (n_col := 5), dtype=np.float64)
+    sym = klujax.analyze(Ai, Aj, n_col)
+    num = klujax.factor(Ai, Aj, Ax, sym)
+
+    def loss_plain(b):
+        return jnp.sum(klujax.solve_with_numeric(num, b, sym) ** 2)
+
+    def loss_token(b):
+        x, _tok = klujax.solve_with_numeric(num, b, sym, return_token=True)
+        return jnp.sum(x**2)
+
+    g_plain = jax.grad(loss_plain)(b)
+    g_token = jax.grad(loss_token)(b)
+    _log_and_test_equality(g_plain, g_token)
+    klujax.free_numeric(num)
+    klujax.free_symbolic(sym)
+
+
+@log_test_name
+def test_return_token_vmap():
+    """vmap over a batch of right-hand sides works with return_token set."""
+    Ai, Aj, Ax, b = _get_rand_arrs_1d(15, (n_col := 5), dtype=np.float64)
+    sym = klujax.analyze(Ai, Aj, n_col)
+    num = klujax.factor(Ai, Aj, Ax, sym)
+    bs = jnp.stack([b * scale for scale in (1.0, 2.0, 3.0)])
+
+    def solve_one(bb):
+        x, _tok = klujax.solve_with_numeric(num, bb, sym, return_token=True)
+        return x
+
+    xs = jax.vmap(solve_one)(bs)
+    A = _dense(Ai, Aj, Ax, n_col, np.float64)
+    _log_and_test_equality(jax.vmap(lambda bb: jsp.linalg.solve(A, bb))(bs), xs)
+    klujax.free_numeric(num)
     klujax.free_symbolic(sym)
