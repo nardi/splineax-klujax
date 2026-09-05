@@ -15,6 +15,7 @@ __all__ = [
     "factor",
     "free_numeric",
     "free_symbolic",
+    "order_numeric_after",
     "rcond",
     "rebuild_count",
     "refactor",
@@ -633,18 +634,20 @@ def _as_batched_values(Ax: Array) -> Array:
     return Ax if Ax.ndim == 2 else Ax[None, :]
 
 
-def _ordered_token(numeric: NumericToken, result: Array) -> NumericToken:
-    """Return a token whose id waits on a read's result.
+def order_numeric_after(numeric: NumericToken, witness: Array) -> NumericToken:
+    """Return a token whose id waits on `witness`.
 
     A read has no output a later write can depend on, so XLA may run an in-place
-    refactor before it. `order_after` takes the result as an ordering operand and
-    passes the numeric id back, which threads the read and the next write onto one
-    chain. The version rides along so a stale token is still caught. See order_after.
+    refactor before it. `order_after` takes an arbitrary witness value as an ordering
+    operand and passes the numeric id back, which threads whatever produced `witness`
+    and the next write onto one chain. `witness` can be any array, for example a
+    solve's own result, or a value from an unrelated computation that must complete
+    first. The version rides along so a stale token is still caught. See order_after.
     """
     if not isinstance(numeric, NumericToken):
-        msg = "return_token=True needs the NumericToken from factor()/refactor()."
+        msg = "order_numeric_after needs the NumericToken from factor()/refactor()."
         raise TypeError(msg)
-    out_id = order_after_p.bind(numeric.id, numeric.version, result)
+    out_id = order_after_p.bind(numeric.id, numeric.version, witness)
     return NumericToken(
         out_id,
         numeric.Ai,
@@ -654,6 +657,10 @@ def _ordered_token(numeric: NumericToken, result: Array) -> NumericToken:
         _ZERO_DEPS,
         numeric.version,
     )
+
+
+_ordered_token = order_numeric_after
+"""Private alias kept for internal call sites in this module."""
 
 
 @partial(jax.jit, static_argnames=("n_col",))
