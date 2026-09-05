@@ -375,13 +375,27 @@ jax.tree_util.register_pytree_node(
     lambda aux, ch: SymbolToken(ch[0], ch[1], ch[2], aux[0], ch[3]),
 )
 
+def _numeric_unflatten(aux, ch):
+    """Rebuild a NumericToken, preserving a None child as None.
+
+    Going through __init__ would turn a None version, which autodiff produces for the
+    version's symbolic-zero tangent, into the concrete _ZERO_VERSION array. That breaks the
+    pytree round-trip and shows up as a spurious tangent leaf on the token, so set the
+    fields directly instead.
+    """
+    obj = object.__new__(NumericToken)
+    obj.id, obj.Ai, obj.Aj, obj.Ax, obj.n_dependent_solutions, obj.version = ch
+    obj.n_col = aux[0]
+    return obj
+
+
 jax.tree_util.register_pytree_node(
     NumericToken,
     lambda t: (
         (t.id, t.Ai, t.Aj, t.Ax, t.n_dependent_solutions, t.version),
         (t.n_col,),
     ),
-    lambda aux, ch: NumericToken(ch[0], ch[1], ch[2], ch[3], aux[0], ch[4], ch[5]),
+    _numeric_unflatten,
 )
 
 

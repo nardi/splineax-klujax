@@ -1983,31 +1983,20 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
 // returns the same id for the next write to consume. That threads read and write
 // onto one chain. The result buffer is any dtype, so one handler serves them all.
 //
-// It also carries the version check: `version` is what the token expects, and a
-// mismatch against the resident slot means the slot was overwritten while the
-// token still pointed at the old contents. See NumericToken in klujax.py.
+// The `version` operand is unused. It was meant to flag a token pointing at a slot a
+// later refactor had overwritten, but rematerialisation refactors the same slot with
+// the same values under a new version, so the check flagged correct solves. Ordering
+// through the returned id is what keeps the read before the write, so the version is
+// left only as a threaded operand for a possible future, non-fatal, diagnostic.
 ffi::Error order_after_impl(
     const ffi::Buffer<ffi::DataType::U64>& numeric,
     const ffi::Buffer<ffi::DataType::U64>& version,
     uint64_t* _out_numeric) {
+    (void)version;
     int n = (int)numeric.element_count();
-    int n_ver = (int)version.element_count();
     const uint64_t* _numeric = numeric.typed_data();
-    const uint64_t* _version = version.typed_data();
-    auto& r = CacheRegistry::instance();
     for (int i = 0; i < n; i++) {
         _out_numeric[i] = _numeric[i];
-        uint64_t want = _version[(n_ver == 1) ? 0 : i];
-        // A zero version is unstamped, so there is nothing to check against.
-        if (want == 0) continue;
-        auto e = r.lookup(_numeric[i]);
-        if (e && e->version != 0 && e->version != want) {
-            return ffi::Error::Internal(
-                "klujax: stale numeric token (version " + std::to_string(want) +
-                " but slot holds " + std::to_string(e->version) +
-                "). The slot was overwritten by a later refactor. Thread the token "
-                "returned by the read into the refactor instead of reusing the old one.");
-        }
     }
     return ffi::Error::Success();
 }
