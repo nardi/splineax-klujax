@@ -1288,6 +1288,11 @@ def analyze_impl(Ai: Array, Aj: Array, n_col: Array) -> Array:
 
 # factor and refactor now also return a per-slot version, so the token knows
 # which write produced it. See NumericToken and order_after.
+# `factor` allocates a fresh cache slot on every call, which a later `refactor` may
+# overwrite in place. That allocation is a side effect, so mark the call `has_side_effect`.
+# Otherwise XLA treats two `factor` calls with equal inputs as one value and may fuse or
+# reorder them, which lets a backward re-factorisation collapse onto a slot the forward
+# already refactored.
 @factor_f64.def_impl
 def factor_f64_impl(Ai, Aj, Ax, symbolic, *, n_col):
     n_lhs = Ax.shape[0]
@@ -1297,6 +1302,7 @@ def factor_f64_impl(Ai, Aj, Ax, symbolic, *, n_col):
             jax.ShapeDtypeStruct((n_lhs,), jnp.uint64),
             jax.ShapeDtypeStruct((n_lhs,), jnp.uint64),
         ),
+        has_side_effect=True,
     )
     return call(Ai, Aj, Ax, symbolic, n_col=np.int64(n_col))
 
@@ -1310,6 +1316,7 @@ def factor_c128_impl(Ai, Aj, Ax, symbolic, *, n_col):
             jax.ShapeDtypeStruct((n_lhs,), jnp.uint64),
             jax.ShapeDtypeStruct((n_lhs,), jnp.uint64),
         ),
+        has_side_effect=True,
     )
     return call(Ai, Aj, Ax, symbolic, n_col=np.int64(n_col))
 
