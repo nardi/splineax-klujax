@@ -1176,14 +1176,33 @@ def analyze_impl(Ai: Array, Aj: Array, n_col: Array) -> Array:
 @factor_f64.def_impl
 def factor_f64_impl(Ai, Aj, Ax, symbolic, *, n_col):
     n_lhs = Ax.shape[0]
-    call = jax.ffi.ffi_call("factor_f64", jax.ShapeDtypeStruct((n_lhs,), jnp.uint64))
+    # factor allocates a fresh cache slot on every call, which a later refactor may
+    # overwrite in place. That allocation is a side effect, so mark the call
+    # has_side_effect: without it, XLA is free to fold two structurally-identical
+    # factor calls into one instruction. This closes that at the raw-instruction level
+    # (see test_factor_ffi_call_itself_is_not_cse_merged). It does NOT by itself
+    # protect the public factor() below: _factor_jit's own nested @jax.jit boundary can
+    # still get two calls with identical arguments merged into one call to that
+    # sub-computation before this flag on the instruction inside it is ever consulted.
+    # A caller needing two independent handles from identical inputs through factor()
+    # has to break that identity itself (perturb one call's own arguments), same as it
+    # would with has_side_effect entirely absent.
+    call = jax.ffi.ffi_call(
+        "factor_f64",
+        jax.ShapeDtypeStruct((n_lhs,), jnp.uint64),
+        has_side_effect=True,
+    )
     return call(Ai, Aj, Ax, symbolic, n_col=np.int64(n_col))
 
 
 @factor_c128.def_impl
 def factor_c128_impl(Ai, Aj, Ax, symbolic, *, n_col):
     n_lhs = Ax.shape[0]
-    call = jax.ffi.ffi_call("factor_c128", jax.ShapeDtypeStruct((n_lhs,), jnp.uint64))
+    call = jax.ffi.ffi_call(
+        "factor_c128",
+        jax.ShapeDtypeStruct((n_lhs,), jnp.uint64),
+        has_side_effect=True,
+    )
     return call(Ai, Aj, Ax, symbolic, n_col=np.int64(n_col))
 
 
