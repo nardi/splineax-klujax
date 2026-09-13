@@ -1277,11 +1277,9 @@ def test_factor_ffi_call_itself_is_not_cse_merged():
     """The raw `factor_f64` custom-call, called twice with identical operands, is not
     CSE-merged into one instruction, now that it is `has_side_effect=True`.
 
-    This checks the guarantee at the level it actually holds. `has_side_effect=True`
-    stops XLA folding two structurally-identical *instructions* into one -- confirmed
-    directly against this fix: reverting it collapses the two `factor_f64` custom-calls
-    below down to one. That matters for any caller relying on two calls with the same
-    inputs producing independent handles (e.g. a differentiation rule isolating a fresh
+    `has_side_effect=True` stops XLA folding two structurally-identical *instructions*
+    into one. That matters for any caller relying on two calls with the same inputs
+    producing independent handles (e.g. a differentiation rule isolating a fresh
     factorization for a tangent solve, where a later refactor of the original handle
     must not silently corrupt the isolated one too).
 
@@ -1318,19 +1316,13 @@ def test_factor_public_api_is_not_cse_merged():
     `jax.jit`, is not CSE-merged into a single call either.
 
     `factor()` wraps the FFI call in its own nested `@jax.jit` (`_factor_jit`, kept
-    separate only for its own `validate_args` canonicalization). That extra jit
-    boundary could in principle hide the inner instruction's `has_side_effect` flag
-    from an outer CSE pass, giving two `factor()` calls with identical inputs the same
-    handle -- which would matter for a caller relying on two calls with the same
-    inputs producing independent handles (e.g. a differentiation rule isolating a
+    separate only for its own `validate_args` canonicalization). `has_side_effect=True`
+    on the inner FFI call survives that nested jit boundary, so two `factor()` calls
+    with identical inputs still lower to two independent custom-calls, for both
+    float64 and complex128. That matters for any caller relying on two calls with the
+    same inputs producing independent handles (e.g. a differentiation rule isolating a
     fresh factorization for a tangent solve, where a later refactor of the original
     handle must not silently corrupt the isolated one too).
-
-    Confirmed this is not the case: `has_side_effect=True` on the inner FFI call
-    survives the nested jit boundary and still stops the outer CSE pass, both for
-    float64 and complex128. (Confirmed the converse too, against a local revert of
-    `has_side_effect` on `factor_f64_impl`/`factor_c128_impl`: the two calls below
-    collapse to one without it.)
     """
     Ai, Aj, Ax, _b = _get_rand_arrs_1d(15, (n_col := 5), dtype=np.float64)
     sym = klujax.analyze(Ai, Aj, n_col)
