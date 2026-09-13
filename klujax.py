@@ -1179,14 +1179,11 @@ def factor_f64_impl(Ai, Aj, Ax, symbolic, *, n_col):
     # factor allocates a fresh cache slot on every call, which a later refactor may
     # overwrite in place. That allocation is a side effect, so mark the call
     # has_side_effect: without it, XLA is free to fold two structurally-identical
-    # factor calls into one instruction. This closes that at the raw-instruction level
-    # (see test_factor_ffi_call_itself_is_not_cse_merged). It does NOT by itself
-    # protect the public factor() below: _factor_jit's own nested @jax.jit boundary can
-    # still get two calls with identical arguments merged into one call to that
-    # sub-computation before this flag on the instruction inside it is ever consulted.
-    # A caller needing two independent handles from identical inputs through factor()
-    # has to break that identity itself (perturb one call's own arguments), same as it
-    # would with has_side_effect entirely absent.
+    # factor calls into one instruction. Verified at both the raw-instruction level
+    # (test_factor_ffi_call_itself_is_not_cse_merged) and through the public factor()
+    # below, which wraps this call in its own nested @jax.jit (_factor_jit): the flag
+    # survives that boundary too, so two factor() calls with identical arguments still
+    # lower to two independent custom-calls (test_factor_public_api_is_not_cse_merged).
     call = jax.ffi.ffi_call(
         "factor_f64",
         jax.ShapeDtypeStruct((n_lhs,), jnp.uint64),
