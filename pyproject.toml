@@ -20,7 +20,7 @@ docs = [
 ]
 
 [project]
-authors = [{name = "Floris Laporte", email = "floris.laporte@gmail.com"}, {name = "Nardi Lam", email = "mail@nardilam.nl"}]
+authors = [{ name = "Floris Laporte", email = "floris.laporte@gmail.com" }, { name = "Nardi Lam", email = "mail@nardilam.nl" }]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Programming Language :: Python :: 3",
