@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.0.post6
+
+- Mark factor as side-effecting so slots stay distinct
+
 ## 0.5.0.post5
 
 - Set default n_dependent_solutions explicitly to fix pytree interop (e.g. `eqx.partition`)
