@@ -1346,44 +1346,28 @@ def analyze_impl(Ai: Array, Aj: Array, n_col: Array) -> Array:
 @factor_f64.def_impl
 def factor_f64_impl(Ai, Aj, Ax, symbolic, *, n_col):
     n_lhs = Ax.shape[0]
-    call = jax.ffi.ffi_call(
-        "factor_f64",
-        jax.ShapeDtypeStruct((n_lhs,), jnp.uint64),
-        has_side_effect=True,
-    )
+    call = jax.ffi.ffi_call("factor_f64", jax.ShapeDtypeStruct((n_lhs,), jnp.uint64))
     return call(Ai, Aj, Ax, symbolic, n_col=np.int64(n_col))
 
 
 @factor_c128.def_impl
 def factor_c128_impl(Ai, Aj, Ax, symbolic, *, n_col):
     n_lhs = Ax.shape[0]
-    call = jax.ffi.ffi_call(
-        "factor_c128",
-        jax.ShapeDtypeStruct((n_lhs,), jnp.uint64),
-        has_side_effect=True,
-    )
+    call = jax.ffi.ffi_call("factor_c128", jax.ShapeDtypeStruct((n_lhs,), jnp.uint64))
     return call(Ai, Aj, Ax, symbolic, n_col=np.int64(n_col))
 
 
 @refactor_f64.def_impl
 def refactor_f64_impl(Ai, Aj, Ax, symbolic, numeric, *, n_col):
     n_lhs = Ax.shape[0]
-    call = jax.ffi.ffi_call(
-        "refactor_f64",
-        jax.ShapeDtypeStruct((n_lhs,), jnp.uint64),
-        has_side_effect=True,
-    )
+    call = jax.ffi.ffi_call("refactor_f64", jax.ShapeDtypeStruct((n_lhs,), jnp.uint64))
     return call(Ai, Aj, Ax, symbolic, numeric, n_col=np.int64(n_col))
 
 
 @refactor_c128.def_impl
 def refactor_c128_impl(Ai, Aj, Ax, symbolic, numeric, *, n_col):
     n_lhs = Ax.shape[0]
-    call = jax.ffi.ffi_call(
-        "refactor_c128",
-        jax.ShapeDtypeStruct((n_lhs,), jnp.uint64),
-        has_side_effect=True,
-    )
+    call = jax.ffi.ffi_call("refactor_c128", jax.ShapeDtypeStruct((n_lhs,), jnp.uint64))
     return call(Ai, Aj, Ax, symbolic, numeric, n_col=np.int64(n_col))
 
 
@@ -1397,7 +1381,6 @@ def refactor_status_f64_impl(Ai, Aj, Ax, symbolic, numeric, *, n_col):
             jax.ShapeDtypeStruct((n_lhs,), jnp.int32),
             jax.ShapeDtypeStruct((n_lhs,), jnp.int32),
         ),
-        has_side_effect=True,
     )
     return call(Ai, Aj, Ax, symbolic, numeric, n_col=np.int64(n_col))
 
@@ -1412,7 +1395,6 @@ def refactor_status_c128_impl(Ai, Aj, Ax, symbolic, numeric, *, n_col):
             jax.ShapeDtypeStruct((n_lhs,), jnp.int32),
             jax.ShapeDtypeStruct((n_lhs,), jnp.int32),
         ),
-        has_side_effect=True,
     )
     return call(Ai, Aj, Ax, symbolic, numeric, n_col=np.int64(n_col))
 
@@ -1778,9 +1760,7 @@ jax.ffi.register_ffi_target(
 solve_with_numeric_status_f64_low = mlir.lower_fun(
     solve_with_numeric_status_f64_impl, multiple_results=True
 )
-mlir.register_lowering(
-    solve_with_numeric_status_f64, solve_with_numeric_status_f64_low
-)
+mlir.register_lowering(solve_with_numeric_status_f64, solve_with_numeric_status_f64_low)
 
 jax.ffi.register_ffi_target(
     "solve_with_numeric_status_c128",

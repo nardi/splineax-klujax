@@ -1274,72 +1274,45 @@ def test_eager_factor_then_jitted_solve_self_heals(monkeypatch):
 
 
 @log_test_name
-def test_factor_ffi_call_itself_is_not_cse_merged():
-    """The raw `factor_f64` custom-call, called twice with identical operands, is not
-    CSE-merged into one instruction, because it has `has_side_effect=True`.
+def test_cse_merged_factor_still_refactors_correctly():
+    """The public `factor()`, called twice with identical arguments under an outer
+    `jax.jit`, is now free to CSE-merge into a single custom-call.
 
-    `has_side_effect=True` stops XLA folding two structurally-identical
-    instructions into one. That matters for any caller relying on two calls with
-    the same inputs producing independent handles (e.g. when the same matrix is
-    factored twice, and then `refactor` is used to modify one of the
-    factorizations).
-
-    See test_factor_public_api_is_not_cse_merged for the same guarantee checked
-    through the public `factor()` API, which wraps this call in its own nested
-    `@jax.jit` (`_factor_jit`).
+    The FFI call doesn't set `has_side_effect`, since factoring is
+    content-addressed and therefore a pure function of its inputs. The two
+    `factor()` results name the same matrix whether or not XLA merges the
+    underlying instruction, and a `refactor` through one alias still leaves the
+    other correct (it rebuilds instead of seeing the new values), exactly as in
+    test_alias_refactor_supersedes.
     """
-    Ai, Aj, Ax, _b = _get_rand_arrs_1d(15, (n_col := 5), dtype=np.float64)
+    # A seed distinct from other tests', so this test's cache entries (including
+    # the refactored-to Ax2) can never dedup-collide with a leftover entry from
+    # another test sharing the module-wide cache and break its assertions.
+    Ai, Aj, Ax, b = _get_rand_arrs_1d(15, (n_col := 5), dtype=np.float64, seed=4242)
+    Ax2 = Ax * 2.0
     sym = klujax.analyze(Ai, Aj, n_col)
 
-    def run_raw(Ai, Aj, Ax, sym_h):
-        call = jax.ffi.ffi_call(
-            "factor_f64", jax.ShapeDtypeStruct((1,), jnp.uint64), has_side_effect=True
-        )
-        Ax_2d = Ax[None, :]
-        return (
-            call(Ai, Aj, Ax_2d, sym_h, n_col=np.int64(n_col)),
-            call(Ai, Aj, Ax_2d, sym_h, n_col=np.int64(n_col)),
-        )
+    def run(Ai, Aj, Ax):
+        return klujax.factor(Ai, Aj, Ax, sym), klujax.factor(Ai, Aj, Ax, sym)
 
-    hlo = str(jax.jit(run_raw).lower(Ai, Aj, Ax, sym.id).compile().as_text())
+    hlo = str(jax.jit(run).lower(Ai, Aj, Ax).compile().as_text())
     factor_calls = sum(
         1 for line in hlo.splitlines() if 'custom_call_target="factor_f64"' in line
     )
-    assert factor_calls == 2, (
-        f"expected 2 independent factor_f64 custom-calls, found {factor_calls}: "
-        "has_side_effect no longer prevents CSE of the raw FFI call"
+    assert factor_calls == 1, (
+        f"expected the two identical factor() calls to CSE-merge into a single "
+        f"factor_f64 custom-call now that has_side_effect is dropped, found "
+        f"{factor_calls}"
     )
 
-
-@log_test_name
-def test_factor_public_api_is_not_cse_merged():
-    """The public `factor()`, called twice with identical arguments under an outer
-    `jax.jit`, is not CSE-merged into a single call either.
-
-    `factor()` wraps the FFI call in its own nested `@jax.jit` (`_factor_jit`, kept
-    separate only for its own `validate_args` canonicalization). `has_side_effect=True`
-    on the inner FFI call survives that nested jit boundary, so two `factor()` calls
-    with identical inputs still lower to two independent custom-calls, for both
-    float64 and complex128.
-    """
-    Ai, Aj, Ax, _b = _get_rand_arrs_1d(15, (n_col := 5), dtype=np.float64)
-    sym = klujax.analyze(Ai, Aj, n_col)
-
-    for dtype, target in [(np.float64, "factor_f64"), (np.complex128, "factor_c128")]:
-        Ax_typed = Ax.astype(dtype)
-
-        def run(Ai, Aj, Ax):
-            return klujax.factor(Ai, Aj, Ax, sym), klujax.factor(Ai, Aj, Ax, sym)
-
-        hlo = str(jax.jit(run).lower(Ai, Aj, Ax_typed).compile().as_text())
-        factor_calls = sum(
-            1 for line in hlo.splitlines() if f'custom_call_target="{target}"' in line
-        )
-        assert factor_calls == 2, (
-            f"expected 2 independent {target} custom-calls through the public "
-            f"factor() API, found {factor_calls}: has_side_effect does not survive "
-            "_factor_jit's nested jit boundary"
-        )
+    num_a, num_b = jax.jit(run)(Ai, Aj, Ax)
+    # One consumer refactors to new values (re-keys the handle in the cache).
+    klujax.refactor(Ai, Aj, Ax2, num_a, sym)
+    # The other, CSE-merged alias still solves against the original matrix.
+    x = klujax.solve_with_numeric(num_b, b, sym)
+    _log_and_test_equality(
+        jsp.linalg.solve(_dense(Ai, Aj, Ax, n_col, np.float64), b), x
+    )
 
 
 # Ordering an explicit free after solves ======================================
