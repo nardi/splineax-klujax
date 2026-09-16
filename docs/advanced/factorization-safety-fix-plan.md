@@ -5,6 +5,12 @@ summary: Make a handle name a matrix (a content hash), not a mutable cache slot
 
 # Fix plan: content-addressed factorization handles
 
+> **Status: implemented.** The core scheme below (single 64-bit content key with
+> check-verified dedup, re-keying refactor, dtype-dispatch fix) has landed. See
+> the [Changelog](../../CHANGELOG.md) and [Memory Management](memory-management.md).
+> The optional check-hash *token* leaf (the `STALE` reason) is reserved, not yet
+> wired through the token.
+
 Goal: kill the failure modes in [Factorization Safety](factorization-safety.md) by
 making a handle **name the matrix it represents** instead of naming a mutable cache
 slot. The handle becomes a content hash of `(dtype, pattern, values)`. A holder can

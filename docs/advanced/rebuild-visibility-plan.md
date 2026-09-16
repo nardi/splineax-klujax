@@ -5,6 +5,11 @@ summary: Surface per-call rebuild events as a RebuildReason status flag
 
 # Plan: per-call rebuild visibility
 
+> **Status: implemented.** `RebuildReason`, the tombstone-backed reasons, the
+> `solve/tsolve_with_numeric_with_status` twins, the extended `refactor_status` /
+> `refactor_and_solve_status`, and `rebuild_stats()` have landed. See the
+> [Changelog](../../CHANGELOG.md).
+
 Under the [content-addressed handle fix](factorization-safety-fix-plan.md) a rebuild
 is the mechanism that keeps a stale handle *correct* — but it is silent per call
 (only the process-global `rebuild_count()` moves). This plan makes each call able to

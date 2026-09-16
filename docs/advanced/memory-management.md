@@ -7,8 +7,17 @@ summary: How klujax handles are cached, freed, and rebuilt
 
 When you use the split API (`analyze`, `factor`, `refactor`), klujax builds KLU
 objects that live in C++ memory. A handle to one of those objects is a **token**,
-not a raw pointer: a small integer id into a process-wide cache, bundled with the
-arrays needed to rebuild the object it names. This makes handles memory-safe.
+not a raw pointer: an id into a process-wide cache, bundled with the arrays needed
+to rebuild the object it names. This makes handles memory-safe.
+
+The id is a **content hash** of the matrix the handle names (dtype + sparsity
+pattern + values), so a handle names a *matrix*, not a mutable slot. Two
+consequences follow. A handle can never be handed the wrong matrix: if the slot it
+named is gone (or was re-keyed by a `refactor`), a call rebuilds the original
+matrix from the arrays the token carries — at worst a rebuild, never a wrong
+answer. And identical matrices hash equal, so factoring the same matrix twice
+reuses one factorization (dedup). `refactor` re-keys to the new values rather than
+overwriting the old handle, so a stale alias of the old token stays correct.
 
 ## The Basics
 
@@ -151,6 +160,25 @@ that:
 | ---------------------- | --------------------------------------------------- |
 | `KLUJAX_FACTOR_CACHE`  | Max live KLU objects before LRU eviction (default 8) |
 | `KLUJAX_STRICT_CACHE`  | If set, a rebuild raises instead of happening quietly |
+
+## Seeing rebuilds per call
+
+`rebuild_count()` is a process-wide total. For per-call visibility, the status
+variants report a `RebuildReason` per numeric handle:
+
+```python
+x, rebuild = klujax.solve_with_numeric_with_status(numeric, b, symbolic)
+# rebuild[i] is a RebuildReason: NONE (used the cached factorization),
+# EVICTED, FREED, SUPERSEDED (a refactor re-keyed this handle -- a stale alias),
+# or UNKNOWN.
+```
+
+`rebuild` is an ordinary array, so you can branch on it under `jax.jit` (for
+example, re-pin a factorization when you see `SUPERSEDED` or `EVICTED` churn). The
+same per-handle `rebuild` is returned by `tsolve_with_numeric_with_status`,
+`refactor_with_status`, and `refactor_and_solve_with_status`.
+`rebuild_stats()` gives the per-reason totals: a rising `SUPERSEDED` points at
+stale-alias use, a rising `EVICTED` at cache pressure.
 
 ## Token Details
 
