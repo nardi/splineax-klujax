@@ -14,6 +14,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <type_traits>
 
 #include "klu.h"
 #include "pybind11/pybind11.h"
@@ -202,19 +203,85 @@ void fill_nan<Complex>(Complex* dst, int n) {
 // Handle cache ================================================================
 //
 // A handle is a uint64 id into this process-global cache, never a raw pointer,
-// so a stale id can never dereference freed memory. Each entry owns its KLU
-// objects and frees them when dropped. A symbolic entry owns a klu_symbolic.
-// A numeric entry also owns a klu_numeric and shares (ref-counts) the symbolic
-// it was factored against, so analysis is reused, not recomputed.
+// so a stale id can never dereference freed memory. The id is a *content hash*
+// of the matrix the handle names (dtype + sparsity pattern + values), so a
+// handle equals hash(content) and whatever the cache returns for a key was
+// built from content whose hash is that key. This makes a handle name a matrix,
+// not a mutable slot: refactor re-keys to the new values instead of overwriting
+// the old id, so a stale alias can never be handed the wrong matrix -- at worst
+// it rebuilds. Identical matrices hash equal, so the cache also deduplicates.
+//
+// Each entry owns its KLU objects and frees them when dropped. A symbolic entry
+// owns a klu_symbolic. A numeric entry also owns a klu_numeric and shares
+// (ref-counts) the symbolic it was factored against, so analysis is reused.
 //
 // The cache is bounded: the least recently used entry is evicted once it grows
 // past KLUJAX_FACTOR_CACHE, so forgetting to free leaks only a bounded amount.
-// A call arriving with an id no longer resident (evicted or freed) rebuilds the
-// state from the Ai/Aj/Ax the caller carries, so use of a freed handle is safe.
+// A call arriving with an id no longer resident (evicted, freed, or superseded
+// by a refactor) rebuilds the state from the Ai/Aj/Ax the caller carries, so
+// use of a gone handle is safe. A bounded tombstone remembers why a retired key
+// went away, so a rebuild can report EVICTED / FREED / SUPERSEDED.
+
+// Why a call rebuilt a factorization instead of using a resident one. Mirrored
+// by RebuildReason in klujax.py. Reported per left-hand side by the *_status ops.
+enum class RebuildReason : int32_t {
+    NONE = 0,        // cache hit; the resident factorization was used
+    EVICTED = 1,     // fell out of the bounded cache (raise KLUJAX_FACTOR_CACHE)
+    FREED = 2,       // free_numeric / free_symbolic had dropped it (expected)
+    SUPERSEDED = 3,  // a refactor re-keyed this handle; a stale alias was used
+    DTYPE = 4,       // reserved: entry present but factored with the other dtype
+    UNKNOWN = 5,     // never resident, or its tombstone was itself evicted
+    STALE = 6,       // reserved: content-check mismatch (collision / forged token)
+};
+static constexpr int kNumRebuildReasons = 7;
+
+// A 128-bit content hash split into a primary key (the cache key) and a second
+// independent check lane. The check makes dedup collision-safe on the cold path
+// (a colliding primary key is caught before an entry is reused) without widening
+// the id that flows through JAX as data.
+struct ContentKey {
+    uint64_t key;
+    uint64_t check;
+};
+
+// Two-lane FNV-1a-style mixing. Not cryptographic; it only needs to spread
+// content across 128 bits well enough that distinct matrices collide with
+// negligible probability.
+inline void hash_fold(uint64_t& a, uint64_t& b, const void* data, size_t n) {
+    const unsigned char* p = static_cast<const unsigned char*>(data);
+    for (size_t i = 0; i < n; i++) {
+        a = (a ^ p[i]) * 0x100000001b3ULL;
+        b = (b + p[i]) * 0x9E3779B97F4A7C15ULL;
+        b ^= b >> 29;
+    }
+}
+
+// Hash canonical CSC content. `domain` separates symbolic ('s') from numeric
+// ('n') keyspaces. For a symbolic key pass Bx=nullptr / bx_bytes=0.
+inline ContentKey hash_content(char domain, bool is_complex, int n_col, int n_nz,
+                               const int* Bp, const int* Bi,
+                               const void* Bx, size_t bx_bytes) {
+    uint64_t a = 0xcbf29ce484222325ULL;
+    uint64_t b = 0x27d4eb2f165667c5ULL;
+    unsigned char tag[2] = {static_cast<unsigned char>(domain),
+                            static_cast<unsigned char>(is_complex ? 1 : 0)};
+    hash_fold(a, b, tag, sizeof(tag));
+    hash_fold(a, b, &n_col, sizeof(n_col));
+    hash_fold(a, b, &n_nz, sizeof(n_nz));
+    hash_fold(a, b, Bp, sizeof(int) * static_cast<size_t>(n_col + 1));
+    hash_fold(a, b, Bi, sizeof(int) * static_cast<size_t>(n_nz));
+    hash_fold(a, b, Bx, bx_bytes);
+    uint64_t key = a ^ (b << 1);
+    uint64_t check = b ^ (a >> 1);
+    if (key == 0) key = 1;  // 0 is the null-handle sentinel, never a real key
+    return {key, check};
+}
 
 struct SymbolicObj {
     klu_symbolic* S = nullptr;
     int n_col = 0;
+    uint64_t key = 0;    // content key of the sparsity pattern
+    uint64_t check = 0;  // second hash lane, for collision-safe dedup
     ~SymbolicObj() {
         if (S) {
             klu_common c;
@@ -227,6 +294,9 @@ struct SymbolicObj {
 struct CacheEntry {
     std::shared_ptr<SymbolicObj> symbolic;  // always set
     klu_numeric* numeric = nullptr;         // null for a symbolic-only entry
+    bool is_complex = false;                // dtype the numeric was factored with
+    uint64_t key = 0;                       // content key this entry is filed under
+    uint64_t check = 0;                     // second hash lane
     ~CacheEntry() {
         if (numeric) {
             klu_common c;
@@ -242,8 +312,16 @@ struct CacheRegistry {
     std::mutex mu;
     std::map<uint64_t, std::shared_ptr<CacheEntry>> entries;
     std::list<uint64_t> lru;  // front = most recently used
-    std::atomic<uint64_t> next_id{1};
+    // Tombstones remember why a retired key went away, so a later miss on it can
+    // name the cause. Bounded like the live cache.
+    std::map<uint64_t, RebuildReason> tombstones;
+    std::list<uint64_t> tomb_lru;
     std::atomic<long> rebuilds{0};
+    std::atomic<long> reason_counts[kNumRebuildReasons];
+
+    CacheRegistry() {
+        for (auto& c : reason_counts) c.store(0);
+    }
 
     static CacheRegistry& instance() {
         static CacheRegistry r;
@@ -267,34 +345,78 @@ struct CacheRegistry {
         return e && e[0] != '\0' && std::strcmp(e, "0") != 0;
     }
 
-    // caller holds mu. 0 and live ids are skipped so an id stays unique.
-    uint64_t fresh_id() {
-        uint64_t id;
-        do {
-            id = next_id.fetch_add(1);
-        } while (id == 0 || entries.count(id));
-        return id;
-    }
-    void touch(uint64_t id) {
+    void touch(uint64_t id) {  // caller holds mu
         lru.remove(id);
         lru.push_front(id);
     }
-    void evict() {
+    // caller holds mu. Remember a retired key and why, bounded by capacity().
+    void record_tombstone(uint64_t id, RebuildReason why) {
+        if (id == 0) return;
+        if (tombstones.find(id) == tombstones.end()) {
+            tomb_lru.push_front(id);
+        } else {
+            tomb_lru.remove(id);
+            tomb_lru.push_front(id);
+        }
+        tombstones[id] = why;
+        size_t cap = capacity();
+        while (tombstones.size() > cap && !tomb_lru.empty()) {
+            uint64_t v = tomb_lru.back();
+            tomb_lru.pop_back();
+            tombstones.erase(v);
+        }
+    }
+    RebuildReason tombstone_reason(uint64_t id) {  // caller holds mu
+        auto it = tombstones.find(id);
+        return it == tombstones.end() ? RebuildReason::UNKNOWN : it->second;
+    }
+    // Public: why is `id` no longer resident? Locks internally.
+    RebuildReason reason_for_missing(uint64_t id) {
+        std::lock_guard<std::mutex> lk(mu);
+        return tombstone_reason(id);
+    }
+    void evict() {  // caller holds mu
         size_t cap = capacity();
         while (entries.size() > cap && !lru.empty()) {
             uint64_t victim = lru.back();
             lru.pop_back();
             entries.erase(victim);
+            record_tombstone(victim, RebuildReason::EVICTED);
         }
     }
-    // Register entry under id (0 mints a fresh one), evicting overflow.
-    uint64_t insert(std::shared_ptr<CacheEntry> e, uint64_t id = 0) {
+    // Register entry under its content key, evicting overflow. A live key is no
+    // longer a tombstone.
+    uint64_t insert(std::shared_ptr<CacheEntry> e, uint64_t key) {
         std::lock_guard<std::mutex> lk(mu);
-        if (id == 0) id = fresh_id();
-        entries[id] = std::move(e);
-        touch(id);
+        e->key = key;
+        entries[key] = std::move(e);
+        auto it = tombstones.find(key);
+        if (it != tombstones.end()) {
+            tombstones.erase(it);
+            tomb_lru.remove(key);
+        }
+        touch(key);
         evict();
-        return id;
+        return key;
+    }
+    // Move an entry from an old key to a new one (refactor). The old key becomes
+    // a SUPERSEDED tombstone so a stale alias of it rebuilds and can say why.
+    void rekey(uint64_t oldk, uint64_t newk, std::shared_ptr<CacheEntry> e) {
+        std::lock_guard<std::mutex> lk(mu);
+        if (oldk != newk) {
+            entries.erase(oldk);
+            lru.remove(oldk);
+            record_tombstone(oldk, RebuildReason::SUPERSEDED);
+        }
+        e->key = newk;
+        entries[newk] = e;
+        auto it = tombstones.find(newk);
+        if (it != tombstones.end()) {
+            tombstones.erase(it);
+            tomb_lru.remove(newk);
+        }
+        touch(newk);
+        evict();
     }
     std::shared_ptr<CacheEntry> lookup(uint64_t id) {
         std::lock_guard<std::mutex> lk(mu);
@@ -303,14 +425,28 @@ struct CacheRegistry {
         touch(id);
         return it->second;
     }
-    void erase(uint64_t id) {
+    void erase(uint64_t id, RebuildReason why) {
         std::lock_guard<std::mutex> lk(mu);
-        entries.erase(id);
-        lru.remove(id);
+        if (entries.erase(id)) {
+            lru.remove(id);
+            record_tombstone(id, why);
+        }
+    }
+    // True when only the registry and the caller's local shared_ptr hold `e`, so
+    // it is safe to mutate in place (no other in-flight call can be reading it).
+    // Best-effort: a conservative false just takes the fresh-factor path.
+    bool uniquely_held(const std::shared_ptr<CacheEntry>& e) {
+        return e.use_count() <= 2;
+    }
+    void note_rebuild(RebuildReason why) {
+        rebuilds.fetch_add(1);
+        int i = static_cast<int>(why);
+        if (i >= 0 && i < kNumRebuildReasons) reason_counts[i].fetch_add(1);
     }
 };
 
-// Build a fresh symbolic analysis from a COO pattern. Returns null on failure.
+// Build a fresh symbolic analysis from a COO pattern, keyed by the pattern hash.
+// Returns null on failure.
 std::shared_ptr<SymbolicObj> build_symbolic(const int* _Ai, const int* _Aj, int n_nz, int n_col) {
     auto _Bi = std::make_unique<int[]>(n_nz);
     auto _Bp = std::make_unique<int[]>(n_col + 1);
@@ -323,36 +459,71 @@ std::shared_ptr<SymbolicObj> build_symbolic(const int* _Ai, const int* _Aj, int 
     auto obj = std::make_shared<SymbolicObj>();
     obj->S = S;
     obj->n_col = n_col;
+    ContentKey ck = hash_content('s', false, n_col, n_nz, _Bp.get(), _Bi.get(), nullptr, 0);
+    obj->key = ck.key;
+    obj->check = ck.check;
     return obj;
 }
 
-// Factor one left-hand side against a symbolic. Returns null on failure.
+// Factor one left-hand side against a symbolic, content-addressed. On a hit for
+// the same content (dtype + pattern + values) the resident entry is reused
+// (dedup, skipping klu_factor); otherwise a fresh entry is built and inserted
+// under its content key. `out_key` receives the content key, `deduped` whether
+// an existing entry was reused. Returns null only on a factor failure (singular).
 template <typename T>
-klu_numeric* build_numeric(SymbolicObj& sym, const int* _Ai, const int* _Aj, int n_nz, const T* _Ax_i) {
-    int n_col = sym.n_col;
+std::shared_ptr<CacheEntry> make_or_get_numeric(std::shared_ptr<SymbolicObj> sym, const int* _Ai,
+                                                const int* _Aj, int n_nz, const T* _Ax_i,
+                                                uint64_t* out_key, bool* deduped) {
+    int n_col = sym->n_col;
     auto _Bi = std::make_unique<int[]>(n_nz);
     auto _Bp = std::make_unique<int[]>(n_col + 1);
     auto _Bk = std::make_unique<int[]>(n_nz);
     auto _Bx = std::make_unique<T[]>(n_nz);
     coo_to_csc_analyze(n_col, n_nz, _Ai, _Aj, _Bi.get(), _Bp.get(), _Bk.get());
     for (int k = 0; k < n_nz; k++) _Bx[k] = _Ax_i[_Bk[k]];
+    bool is_complex = std::is_same<T, Complex>::value;
+    ContentKey ck = hash_content('n', is_complex, n_col, n_nz, _Bp.get(), _Bi.get(),
+                                 _Bx.get(), sizeof(T) * static_cast<size_t>(n_nz));
+    auto& r = CacheRegistry::instance();
+    if (auto e = r.lookup(ck.key)) {
+        // Reuse only if the second hash lane also agrees, so a (vanishingly rare)
+        // primary-key collision never hands back the wrong factorization.
+        if (e->numeric && e->is_complex == is_complex && e->check == ck.check) {
+            if (out_key) *out_key = ck.key;
+            if (deduped) *deduped = true;
+            return e;
+        }
+    }
     klu_common Common;
     klu_defaults(&Common);
-    klu_numeric* N = KluTraits<T>::factor(_Bp.get(), _Bi.get(), _Bx.get(), sym.S, &Common);
+    klu_numeric* N = KluTraits<T>::factor(_Bp.get(), _Bi.get(), _Bx.get(), sym->S, &Common);
     if (N == nullptr || Common.status < KLU_OK) {
         if (N) klu_free_numeric(&N, &Common);
         return nullptr;
     }
-    return N;
+    auto e = std::make_shared<CacheEntry>();
+    e->symbolic = sym;
+    e->numeric = N;
+    e->is_complex = is_complex;
+    e->check = ck.check;
+    r.insert(e, ck.key);
+    if (out_key) *out_key = ck.key;
+    if (deduped) *deduped = false;
+    return e;
 }
 
 // Resolve a symbolic id, rebuilding from the caller's pattern on a miss. The
 // heavy klu_analyze runs outside the registry lock. Sets `err` and returns null
-// only on strict-mode miss or an analyze failure.
+// only on strict-mode miss or an analyze failure. `reason` (if given) reports
+// whether a rebuild happened and why.
 std::shared_ptr<SymbolicObj> resolve_symbolic(uint64_t id, const int* _Ai, const int* _Aj, int n_nz,
-                                              int n_col, ffi::Error& err) {
+                                              int n_col, ffi::Error& err,
+                                              RebuildReason* reason = nullptr) {
     auto& r = CacheRegistry::instance();
-    if (auto e = r.lookup(id)) return e->symbolic;
+    if (auto e = r.lookup(id)) {
+        if (reason) *reason = RebuildReason::NONE;
+        return e->symbolic;
+    }
     if (CacheRegistry::strict()) {
         err = ffi::Error::Internal("klujax: symbolic handle " + std::to_string(id) +
                                    " was evicted or freed and strict cache mode is on");
@@ -363,26 +534,38 @@ std::shared_ptr<SymbolicObj> resolve_symbolic(uint64_t id, const int* _Ai, const
         err = ffi::Error::Internal("klujax: rebuild of symbolic handle failed (klu_analyze)");
         return nullptr;
     }
-    r.rebuilds.fetch_add(1);
+    RebuildReason why = r.reason_for_missing(id);
+    r.note_rebuild(why);
     auto e = std::make_shared<CacheEntry>();
     e->symbolic = sym;
-    r.insert(e, id);  // heal under the same id so later calls hit
+    r.insert(e, sym->key);  // file under the true content key
+    if (reason) *reason = why;
     return sym;
 }
 
 // Resolve one numeric id, rebuilding analysis and factorization from the
 // caller's matrix on a miss. Returns the whole entry so the solver can use its
-// self-consistent symbolic/numeric pair.
+// self-consistent symbolic/numeric pair. A resident entry whose dtype disagrees
+// with the requested solve is a hard error (never a silent wrong-dtype solve).
 template <typename T>
 std::shared_ptr<CacheEntry> resolve_numeric(uint64_t id, const int* _Ai, const int* _Aj, int n_nz,
                                             int n_col, const T* _Ax_i, ffi::Error& err,
-                                            bool* rebuilt = nullptr) {
-    if (rebuilt) *rebuilt = false;
+                                            RebuildReason* reason = nullptr) {
+    bool is_complex = std::is_same<T, Complex>::value;
     auto& r = CacheRegistry::instance();
     if (auto e = r.lookup(id)) {
-        if (e->numeric) return e;
+        if (e->numeric) {
+            if (e->is_complex != is_complex) {
+                err = ffi::Error::InvalidArgument(
+                    "klujax: numeric handle dtype mismatch (factored as " +
+                    std::string(e->is_complex ? "complex" : "real") + ", used as " +
+                    std::string(is_complex ? "complex" : "real") + ")");
+                return nullptr;
+            }
+            if (reason) *reason = RebuildReason::NONE;
+            return e;
+        }
     }
-    if (rebuilt) *rebuilt = true;
     if (CacheRegistry::strict()) {
         err = ffi::Error::Internal("klujax: numeric handle " + std::to_string(id) +
                                    " was evicted or freed and strict cache mode is on");
@@ -393,16 +576,85 @@ std::shared_ptr<CacheEntry> resolve_numeric(uint64_t id, const int* _Ai, const i
         err = ffi::Error::Internal("klujax: rebuild of numeric handle failed (klu_analyze)");
         return nullptr;
     }
-    klu_numeric* N = build_numeric<T>(*sym, _Ai, _Aj, n_nz, _Ax_i);
-    if (!N) {
-        err = ffi::Error::Internal("klujax: rebuild of numeric handle failed (klu_factor)");
+    uint64_t key = 0;
+    bool deduped = false;
+    auto e = make_or_get_numeric<T>(sym, _Ai, _Aj, n_nz, _Ax_i, &key, &deduped);
+    if (!e) {
+        err = ffi::Error::InvalidArgument("klujax: rebuild of numeric handle failed (klu_factor)");
         return nullptr;
     }
-    auto e = std::make_shared<CacheEntry>();
-    e->symbolic = sym;
-    e->numeric = N;
-    r.rebuilds.fetch_add(1);
-    r.insert(e, id);
+    RebuildReason why = r.reason_for_missing(id);
+    r.note_rebuild(why);
+    if (reason) *reason = why;
+    return e;
+}
+
+// Shared by refactor and refactor_and_solve: bring the numeric named by K0 up to
+// the new values, content-addressed. Returns the up-to-date entry and, via
+// out-params, the new content key, the KLU status of any in-place refactor, and
+// the rebuild reason. Returns null with `*klu_status < KLU_OK` on a singular
+// matrix, or null with `err` set on an analyze failure.
+template <typename T>
+std::shared_ptr<CacheEntry> refactor_to_entry(uint64_t K0, const int* _Ai, const int* _Aj, int n_nz,
+                                              int n_col, const int* _Bp, const int* _Bi, T* _Bx,
+                                              const T* _Ax_i, const ContentKey& ck,
+                                              uint64_t* out_key, int32_t* klu_status,
+                                              RebuildReason* reason, ffi::Error& err) {
+    bool is_complex = std::is_same<T, Complex>::value;
+    auto& r = CacheRegistry::instance();
+    uint64_t K1 = ck.key;
+    *out_key = K1;
+    *klu_status = KLU_OK;
+    *reason = RebuildReason::NONE;
+
+    // Values unchanged, or the new content is already cached: reuse it (dedup).
+    if (auto e1 = r.lookup(K1)) {
+        if (e1->numeric && e1->is_complex == is_complex && e1->check == ck.check) {
+            return e1;
+        }
+    }
+
+    // The old numeric is resident and safe to mutate: klu_refactor in place
+    // (reusing its pivots) then move it to the new key. This keeps refactor fast
+    // while a stale alias of K0 rebuilds correctly (SUPERSEDED).
+    auto e0 = r.lookup(K0);
+    if (e0 && e0->numeric && e0->is_complex == is_complex && r.uniquely_held(e0)) {
+        klu_common Common;
+        klu_defaults(&Common);
+        Common.status = KLU_OK;
+        int ok = KluTraits<T>::refactor(const_cast<int*>(_Bp), const_cast<int*>(_Bi), _Bx,
+                                        e0->symbolic->S, e0->numeric, &Common);
+        if (!ok && Common.status == KLU_OK) Common.status = KLU_SINGULAR;
+        *klu_status = (int32_t)Common.status;
+        if (ok && Common.status >= KLU_OK) {
+            e0->check = ck.check;
+            r.rekey(K0, K1, e0);
+            return e0;
+        }
+        // A failed in-place refactor leaves the numeric partially overwritten;
+        // drop it so a later use rebuilds cleanly.
+        r.erase(K0, RebuildReason::SUPERSEDED);
+        return nullptr;
+    }
+
+    // Fresh factor under the new key (dedup-aware). If K0 was resident we leave it
+    // intact, so its aliases still hit; otherwise the tombstone says why it went.
+    auto sym = e0 ? e0->symbolic : build_symbolic(_Ai, _Aj, n_nz, n_col);
+    if (!sym) {
+        err = ffi::Error::Internal("klujax: analyze failed on refactor rebuild");
+        return nullptr;
+    }
+    uint64_t key = 0;
+    bool deduped = false;
+    auto e = make_or_get_numeric<T>(sym, _Ai, _Aj, n_nz, _Ax_i, &key, &deduped);
+    if (!e) {
+        *klu_status = KLU_SINGULAR;  // singular matrix, not an internal error
+        *reason = e0 ? RebuildReason::NONE : r.reason_for_missing(K0);
+        if (!e0) r.note_rebuild(*reason);
+        return nullptr;
+    }
+    *reason = e0 ? RebuildReason::NONE : r.reason_for_missing(K0);
+    if (!e0) r.note_rebuild(*reason);
     return e;
 }
 
@@ -934,19 +1186,18 @@ ffi::Error factor_impl(
     auto sym = resolve_symbolic(sym_id, _Ai, _Aj, n_nz, n_col, err);
     if (!sym) return err;
 
-    auto& registry = CacheRegistry::instance();
     for (int i = 0; i < n_lhs; i++) {
         const T* _Ax_i = _Ax + (size_t)i * n_nz;
-        klu_numeric* Numeric = build_numeric<T>(*sym, _Ai, _Aj, n_nz, _Ax_i);
-        if (Numeric == nullptr) {
+        // The id is the content key of this matrix: identical matrices dedup to
+        // one factorization, and the key is the data edge XLA orders solves
+        // against, so no optimization_barrier is needed.
+        uint64_t key = 0;
+        bool deduped = false;
+        auto entry = make_or_get_numeric<T>(sym, _Ai, _Aj, n_nz, _Ax_i, &key, &deduped);
+        if (!entry) {
             return ffi::Error::InvalidArgument("klu_factor/z_factor failed (singular matrix?)");
         }
-        // A fresh id names one immutable factorization: this is the data edge
-        // XLA orders solves against, and why no optimization_barrier is needed.
-        auto entry = std::make_shared<CacheEntry>();
-        entry->symbolic = sym;
-        entry->numeric = Numeric;
-        _numeric[i] = registry.insert(entry);
+        _numeric[i] = key;
     }
     return ffi::Error::Success();
 }
@@ -1008,7 +1259,8 @@ ffi::Error refactor_impl(
     const ffi::Buffer<ffi::DataType::U64>& numeric,
     const T* _Ax,
     uint64_t* _out_numeric,
-    int32_t* _out_status = nullptr) {
+    int32_t* _out_status = nullptr,
+    int32_t* _out_rebuild = nullptr) {
     (void)symbolic;  // numeric handle is self-contained, uses its own analysis
 
     int n_lhs = (int)ds_Ax[0];
@@ -1023,43 +1275,35 @@ ffi::Error refactor_impl(
     const int* _Aj = Aj.typed_data();
     const uint64_t* _numeric = numeric.typed_data();
 
-    // Shared CSC pattern, used by the in-place refactor of resident entries.
+    // Shared CSC pattern; values (Bx) and the content key are per left-hand side.
     auto _Bk = std::make_unique<int[]>(n_nz);
     auto _Bi = std::make_unique<int[]>(n_nz);
     auto _Bp = std::make_unique<int[]>(n_col + 1);
     auto _Bx = std::make_unique<T[]>(n_nz);
+    bool is_complex = std::is_same<T, Complex>::value;
 
     coo_to_csc_analyze(n_col, n_nz, _Ai, _Aj, _Bi.get(), _Bp.get(), _Bk.get());
 
-    klu_common Common;
-    klu_defaults(&Common);
-
     for (int i = 0; i < n_lhs; i++) {
         const T* _Ax_i = _Ax + (size_t)i * n_nz;
+        for (int k = 0; k < n_nz; k++) _Bx[k] = _Ax_i[_Bk[k]];
+        ContentKey ck = hash_content('n', is_complex, n_col, n_nz, _Bp.get(), _Bi.get(),
+                                     _Bx.get(), sizeof(T) * (size_t)n_nz);
+        uint64_t out_key = 0;
+        int32_t klu_status = KLU_OK;
+        RebuildReason reason = RebuildReason::NONE;
         ffi::Error err = ffi::Error::Success();
-        bool rebuilt = false;
-        auto entry = resolve_numeric<T>(_numeric[i], _Ai, _Aj, n_nz, n_col, _Ax_i, err, &rebuilt);
-        if (!entry) return err;
-
-        // A rebuilt entry was just factored with these values, so it is already
-        // the refactored state. Only a resident entry needs the refactor.
-        if (!rebuilt) {
-            for (int k = 0; k < n_nz; k++) _Bx[k] = _Ax_i[_Bk[k]];
-            Common.status = KLU_OK;
-            int ok = KluTraits<T>::refactor(_Bp.get(), _Bi.get(), _Bx.get(),
-                                            entry->symbolic->S, entry->numeric, &Common);
-            if (!ok && Common.status == KLU_OK) {
-                Common.status = KLU_SINGULAR;
-            }
-            if ((!ok || Common.status < KLU_OK) && _out_status == nullptr) {
-                return ffi::Error::InvalidArgument("klu_refactor/z_refactor failed (singular matrix?)");
-            }
-            if (_out_status != nullptr) _out_status[i] = (int32_t)Common.status;
-        } else if (_out_status != nullptr) {
-            _out_status[i] = KLU_OK;
+        auto entry = refactor_to_entry<T>(_numeric[i], _Ai, _Aj, n_nz, n_col, _Bp.get(), _Bi.get(),
+                                          _Bx.get(), _Ax_i, ck, &out_key, &klu_status, &reason, err);
+        if (err.failure()) return err;
+        if (!entry && (klu_status < KLU_OK) && _out_status == nullptr) {
+            return ffi::Error::InvalidArgument("klu_refactor/z_refactor failed (singular matrix?)");
         }
-        // Same id back out, so XLA sees the data edge refactor -> solve.
-        _out_numeric[i] = _numeric[i];
+        // Re-key: the new content is a new handle, so a stale alias of the old id
+        // can never be handed these new values (it rebuilds instead).
+        _out_numeric[i] = out_key;
+        if (_out_status != nullptr) _out_status[i] = klu_status;
+        if (_out_rebuild != nullptr) _out_rebuild[i] = (int32_t)reason;
     }
     return ffi::Error::Success();
 }
@@ -1122,9 +1366,11 @@ ffi::Error refactor_status_f64(
     const ffi::Buffer<ffi::DataType::U64> symbolic,
     const ffi::Buffer<ffi::DataType::U64> numeric,
     ffi::Result<ffi::Buffer<ffi::DataType::U64>> out_numeric,
-    ffi::Result<ffi::Buffer<ffi::DataType::S32>> out_status) {
+    ffi::Result<ffi::Buffer<ffi::DataType::S32>> out_status,
+    ffi::Result<ffi::Buffer<ffi::DataType::S32>> out_rebuild) {
     return refactor_impl<double>(n_col, Ai, Aj, Ax.dimensions(), symbolic, numeric, Ax.typed_data(),
-                                 out_numeric->typed_data(), out_status->typed_data());
+                                 out_numeric->typed_data(), out_status->typed_data(),
+                                 out_rebuild->typed_data());
 }
 
 ffi::Error refactor_status_c128(
@@ -1135,10 +1381,12 @@ ffi::Error refactor_status_c128(
     const ffi::Buffer<ffi::DataType::U64> symbolic,
     const ffi::Buffer<ffi::DataType::U64> numeric,
     ffi::Result<ffi::Buffer<ffi::DataType::U64>> out_numeric,
-    ffi::Result<ffi::Buffer<ffi::DataType::S32>> out_status) {
+    ffi::Result<ffi::Buffer<ffi::DataType::S32>> out_status,
+    ffi::Result<ffi::Buffer<ffi::DataType::S32>> out_rebuild) {
     return refactor_impl<Complex>(n_col, Ai, Aj, Ax.dimensions(), symbolic, numeric,
                                   reinterpret_cast<const Complex*>(Ax.typed_data()),
-                                  out_numeric->typed_data(), out_status->typed_data());
+                                  out_numeric->typed_data(), out_status->typed_data(),
+                                  out_rebuild->typed_data());
 }
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
@@ -1150,8 +1398,9 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<ffi::Buffer<ffi::DataType::F64>>()  // Ax
         .Arg<ffi::Buffer<ffi::DataType::U64>>()  // symbolic
         .Arg<ffi::Buffer<ffi::DataType::U64>>()  // numeric (input handles)
-        .Ret<ffi::Buffer<ffi::DataType::U64>>()  // out_numeric (same handles, for XLA dep edge)
+        .Ret<ffi::Buffer<ffi::DataType::U64>>()  // out_numeric (new content keys)
         .Ret<ffi::Buffer<ffi::DataType::S32>>()  // out_status (KLU status per batch element)
+        .Ret<ffi::Buffer<ffi::DataType::S32>>()  // out_rebuild (RebuildReason per element)
 );
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
@@ -1163,8 +1412,9 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<ffi::Buffer<ffi::DataType::C128>>()  // Ax
         .Arg<ffi::Buffer<ffi::DataType::U64>>()   // symbolic
         .Arg<ffi::Buffer<ffi::DataType::U64>>()   // numeric (input handles)
-        .Ret<ffi::Buffer<ffi::DataType::U64>>()   // out_numeric (same handles, for XLA dep edge)
+        .Ret<ffi::Buffer<ffi::DataType::U64>>()   // out_numeric (new content keys)
         .Ret<ffi::Buffer<ffi::DataType::S32>>()   // out_status (KLU status per batch element)
+        .Ret<ffi::Buffer<ffi::DataType::S32>>()   // out_rebuild (RebuildReason per element)
 );
 
 // refactor_and_solve: fused in-place refactorization followed by triangular solve.
@@ -1183,7 +1433,8 @@ ffi::Error refactor_and_solve_impl(
     const T* _b,
     T* _x,
     uint64_t* _out_numeric,
-    int32_t* _out_status = nullptr) {
+    int32_t* _out_status = nullptr,
+    int32_t* _out_rebuild = nullptr) {
     (void)symbolic;  // numeric handle is self-contained, uses its own analysis
 
     int n_lhs_ax = (int)ds_Ax[0];
@@ -1228,34 +1479,37 @@ ffi::Error refactor_and_solve_impl(
     klu_common Common;
     klu_defaults(&Common);
 
+    bool is_complex = std::is_same<T, Complex>::value;
     for (int i = 0; i < n_lhs; i++) {
         const T* _Ax_i = _Ax + (size_t)i * n_nz;
         int n = i * n_rhs * n_col;
 
+        for (int k = 0; k < n_nz; k++) _Bx[k] = _Ax_i[_Bk[k]];
+        ContentKey ck = hash_content('n', is_complex, n_col, n_nz, _Bp.get(), _Bi.get(),
+                                     _Bx.get(), sizeof(T) * (size_t)n_nz);
+        uint64_t out_key = 0;
+        int32_t klu_status = KLU_OK;
+        RebuildReason reason = RebuildReason::NONE;
         ffi::Error err = ffi::Error::Success();
-        bool rebuilt = false;
-        auto entry = resolve_numeric<T>(_numeric[i], _Ai, _Aj, n_nz, n_col, _Ax_i, err, &rebuilt);
-        if (!entry) return err;
+        // Bring the numeric up to the new values (in-place refactor + re-key when
+        // possible, else a fresh factor). Re-keying means a stale alias of the old
+        // id can never be handed these values.
+        auto entry = refactor_to_entry<T>(_numeric[i], _Ai, _Aj, n_nz, n_col, _Bp.get(), _Bi.get(),
+                                          _Bx.get(), _Ax_i, ck, &out_key, &klu_status, &reason, err);
+        if (err.failure()) return err;
 
-        // A rebuilt entry is already factored with these values. A resident one
-        // is refactored in place, reusing its pivots. A singular result fills
-        // this element's output with NaN rather than aborting the whole call.
-        Common.status = KLU_OK;
-        int ok = 1;
-        if (!rebuilt) {
-            for (int k = 0; k < n_nz; k++) _Bx[k] = _Ax_i[_Bk[k]];
-            ok = KluTraits<T>::refactor(_Bp.get(), _Bi.get(), _Bx.get(),
-                                        entry->symbolic->S, entry->numeric, &Common);
-            if (!ok && Common.status == KLU_OK) Common.status = KLU_SINGULAR;
-        }
-        // Same id back out on every path, for the XLA edge refactor -> solve.
-        _out_numeric[i] = _numeric[i];
-        if (!ok || Common.status < KLU_OK) {
+        _out_numeric[i] = out_key;
+        if (_out_rebuild != nullptr) _out_rebuild[i] = (int32_t)reason;
+
+        // A singular refactor/factor fills this element's output with NaN rather
+        // than aborting the whole call.
+        if (!entry || klu_status < KLU_OK) {
             fill_nan(&_x_temp[n], n_rhs * n_col);
-            if (_out_status != nullptr) _out_status[i] = (int32_t)Common.status;
+            if (_out_status != nullptr) _out_status[i] = (int32_t)klu_status;
             continue;
         }
 
+        Common.status = KLU_OK;
         KluTraits<T>::solve(entry->symbolic->S, entry->numeric, n_col, n_rhs, &_x_temp[n], &Common);
         if (Common.status < KLU_OK) {
             fill_nan(&_x_temp[n], n_rhs * n_col);
@@ -1343,11 +1597,12 @@ ffi::Error refactor_and_solve_status_f64(
     const ffi::Buffer<ffi::DataType::U64> numeric,
     ffi::Result<ffi::Buffer<ffi::DataType::F64>> x,
     ffi::Result<ffi::Buffer<ffi::DataType::U64>> out_numeric,
-    ffi::Result<ffi::Buffer<ffi::DataType::S32>> out_status) {
+    ffi::Result<ffi::Buffer<ffi::DataType::S32>> out_status,
+    ffi::Result<ffi::Buffer<ffi::DataType::S32>> out_rebuild) {
     return refactor_and_solve_impl<double>(
         Ai, Aj, Ax.dimensions(), b.dimensions(), symbolic, numeric,
         Ax.typed_data(), b.typed_data(), x->typed_data(), out_numeric->typed_data(),
-        out_status->typed_data());
+        out_status->typed_data(), out_rebuild->typed_data());
 }
 
 ffi::Error refactor_and_solve_status_c128(
@@ -1359,13 +1614,14 @@ ffi::Error refactor_and_solve_status_c128(
     const ffi::Buffer<ffi::DataType::U64> numeric,
     ffi::Result<ffi::Buffer<ffi::DataType::C128>> x,
     ffi::Result<ffi::Buffer<ffi::DataType::U64>> out_numeric,
-    ffi::Result<ffi::Buffer<ffi::DataType::S32>> out_status) {
+    ffi::Result<ffi::Buffer<ffi::DataType::S32>> out_status,
+    ffi::Result<ffi::Buffer<ffi::DataType::S32>> out_rebuild) {
     return refactor_and_solve_impl<Complex>(
         Ai, Aj, Ax.dimensions(), b.dimensions(), symbolic, numeric,
         reinterpret_cast<const Complex*>(Ax.typed_data()),
         reinterpret_cast<const Complex*>(b.typed_data()),
         reinterpret_cast<Complex*>(x->typed_data()),
-        out_numeric->typed_data(), out_status->typed_data());
+        out_numeric->typed_data(), out_status->typed_data(), out_rebuild->typed_data());
 }
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
@@ -1378,8 +1634,9 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<ffi::Buffer<ffi::DataType::U64>>()  // symbolic
         .Arg<ffi::Buffer<ffi::DataType::U64>>()  // numeric (input handles)
         .Ret<ffi::Buffer<ffi::DataType::F64>>()  // x (solution)
-        .Ret<ffi::Buffer<ffi::DataType::U64>>()  // out_numeric (same handles, for XLA dep edge)
+        .Ret<ffi::Buffer<ffi::DataType::U64>>()  // out_numeric (new content keys)
         .Ret<ffi::Buffer<ffi::DataType::S32>>()  // out_status (KLU status per batch element)
+        .Ret<ffi::Buffer<ffi::DataType::S32>>()  // out_rebuild (RebuildReason per element)
 );
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
@@ -1392,8 +1649,9 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<ffi::Buffer<ffi::DataType::U64>>()   // symbolic
         .Arg<ffi::Buffer<ffi::DataType::U64>>()   // numeric (input handles)
         .Ret<ffi::Buffer<ffi::DataType::C128>>()  // x (solution)
-        .Ret<ffi::Buffer<ffi::DataType::U64>>()   // out_numeric (same handles, for XLA dep edge)
+        .Ret<ffi::Buffer<ffi::DataType::U64>>()   // out_numeric (new content keys)
         .Ret<ffi::Buffer<ffi::DataType::S32>>()   // out_status (KLU status per batch element)
+        .Ret<ffi::Buffer<ffi::DataType::S32>>()   // out_rebuild (RebuildReason per element)
 );
 
 // rcond: reciprocal pivot growth estimate min|Uii| / max|Uii|, computed in O(n) from an
@@ -1600,10 +1858,14 @@ ffi::Error solve_with_numeric_impl(
     const ffi::Buffer<ffi::DataType::U64>& numeric,
     const T* _Ax,
     const T* _b,
-    T* _x) {
+    T* _x,
+    int32_t* _out_rebuild = nullptr) {
     (void)symbolic;  // numeric handle is self-contained, uses its own analysis
 
     int n_numeric = numeric.element_count();
+    if (_out_rebuild != nullptr) {
+        for (int i = 0; i < n_numeric; i++) _out_rebuild[i] = (int32_t)RebuildReason::NONE;
+    }
     const uint64_t* _numeric = numeric.typed_data();
     const int* _Ai = Ai.typed_data();
     const int* _Aj = Aj.typed_data();
@@ -1690,8 +1952,10 @@ ffi::Error solve_with_numeric_impl(
         const T* _Ax_i = _Ax + (size_t)ax_i * n_nz;
 
         ffi::Error err = ffi::Error::Success();
-        auto entry = resolve_numeric<T>(_numeric[num_i], _Ai, _Aj, n_nz, n_col, _Ax_i, err);
+        RebuildReason reason = RebuildReason::NONE;
+        auto entry = resolve_numeric<T>(_numeric[num_i], _Ai, _Aj, n_nz, n_col, _Ax_i, err, &reason);
         if (!entry) return err;
+        if (_out_rebuild != nullptr) _out_rebuild[num_i] = (int32_t)reason;
 
         KluTraits<T>::solve(entry->symbolic->S, entry->numeric, n_col, n_rhs, &_x_temp[n], &Common);
 
@@ -1763,6 +2027,63 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<ffi::Buffer<ffi::DataType::C128>>()  // b
         .Ret<ffi::Buffer<ffi::DataType::C128>>());
 
+// solve_with_numeric_status: as solve_with_numeric, plus a per-numeric-handle
+// RebuildReason so a caller can see whether (and why) a handle had to be rebuilt.
+ffi::Error solve_with_numeric_status_f64(
+    const ffi::Buffer<ffi::DataType::S32> Ai,
+    const ffi::Buffer<ffi::DataType::S32> Aj,
+    const ffi::Buffer<ffi::DataType::F64> Ax,
+    const ffi::Buffer<ffi::DataType::U64> symbolic,
+    const ffi::Buffer<ffi::DataType::U64> numeric,
+    const ffi::Buffer<ffi::DataType::F64> b,
+    ffi::Result<ffi::Buffer<ffi::DataType::F64>> x,
+    ffi::Result<ffi::Buffer<ffi::DataType::S32>> out_rebuild) {
+    return solve_with_numeric_impl<double>(Ai, Aj, Ax.dimensions(), b.dimensions(), x->dimensions(),
+                                           symbolic, numeric, Ax.typed_data(), b.typed_data(),
+                                           x->typed_data(), out_rebuild->typed_data());
+}
+
+ffi::Error solve_with_numeric_status_c128(
+    const ffi::Buffer<ffi::DataType::S32> Ai,
+    const ffi::Buffer<ffi::DataType::S32> Aj,
+    const ffi::Buffer<ffi::DataType::C128> Ax,
+    const ffi::Buffer<ffi::DataType::U64> symbolic,
+    const ffi::Buffer<ffi::DataType::U64> numeric,
+    const ffi::Buffer<ffi::DataType::C128> b,
+    ffi::Result<ffi::Buffer<ffi::DataType::C128>> x,
+    ffi::Result<ffi::Buffer<ffi::DataType::S32>> out_rebuild) {
+    return solve_with_numeric_impl<Complex>(Ai, Aj, Ax.dimensions(), b.dimensions(), x->dimensions(),
+                                            symbolic, numeric,
+                                            reinterpret_cast<const Complex*>(Ax.typed_data()),
+                                            reinterpret_cast<const Complex*>(b.typed_data()),
+                                            reinterpret_cast<Complex*>(x->typed_data()),
+                                            out_rebuild->typed_data());
+}
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    solve_with_numeric_status_f64_handler, solve_with_numeric_status_f64,
+    ffi::Ffi::Bind()
+        .Arg<ffi::Buffer<ffi::DataType::S32>>()  // Ai
+        .Arg<ffi::Buffer<ffi::DataType::S32>>()  // Aj
+        .Arg<ffi::Buffer<ffi::DataType::F64>>()  // Ax
+        .Arg<ffi::Buffer<ffi::DataType::U64>>()  // symbolic
+        .Arg<ffi::Buffer<ffi::DataType::U64>>()  // numeric
+        .Arg<ffi::Buffer<ffi::DataType::F64>>()  // b
+        .Ret<ffi::Buffer<ffi::DataType::F64>>()  // x
+        .Ret<ffi::Buffer<ffi::DataType::S32>>());  // out_rebuild (per numeric handle)
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    solve_with_numeric_status_c128_handler, solve_with_numeric_status_c128,
+    ffi::Ffi::Bind()
+        .Arg<ffi::Buffer<ffi::DataType::S32>>()   // Ai
+        .Arg<ffi::Buffer<ffi::DataType::S32>>()   // Aj
+        .Arg<ffi::Buffer<ffi::DataType::C128>>()  // Ax
+        .Arg<ffi::Buffer<ffi::DataType::U64>>()   // symbolic
+        .Arg<ffi::Buffer<ffi::DataType::U64>>()   // numeric
+        .Arg<ffi::Buffer<ffi::DataType::C128>>()  // b
+        .Ret<ffi::Buffer<ffi::DataType::C128>>()  // x
+        .Ret<ffi::Buffer<ffi::DataType::S32>>());  // out_rebuild (per numeric handle)
+
 // tsolve_with_numeric: identical to solve_with_numeric_impl but uses KluTraits<T>::tsolve.
 // Solves A^T x = b using a pre-computed numeric factorization.
 template <typename T>
@@ -1776,10 +2097,14 @@ ffi::Error tsolve_with_numeric_impl(
     const ffi::Buffer<ffi::DataType::U64>& numeric,
     const T* _Ax,
     const T* _b,
-    T* _x) {
+    T* _x,
+    int32_t* _out_rebuild = nullptr) {
     (void)symbolic;  // numeric handle is self-contained, uses its own analysis
 
     int n_numeric = numeric.element_count();
+    if (_out_rebuild != nullptr) {
+        for (int i = 0; i < n_numeric; i++) _out_rebuild[i] = (int32_t)RebuildReason::NONE;
+    }
     const uint64_t* _numeric = numeric.typed_data();
     const int* _Ai = Ai.typed_data();
     const int* _Aj = Aj.typed_data();
@@ -1852,8 +2177,10 @@ ffi::Error tsolve_with_numeric_impl(
         const T* _Ax_i = _Ax + (size_t)ax_i * n_nz;
 
         ffi::Error err = ffi::Error::Success();
-        auto entry = resolve_numeric<T>(_numeric[num_i], _Ai, _Aj, n_nz, n_col, _Ax_i, err);
+        RebuildReason reason = RebuildReason::NONE;
+        auto entry = resolve_numeric<T>(_numeric[num_i], _Ai, _Aj, n_nz, n_col, _Ax_i, err, &reason);
         if (!entry) return err;
+        if (_out_rebuild != nullptr) _out_rebuild[num_i] = (int32_t)reason;
 
         // NOTE: tsolve instead of solve
         KluTraits<T>::tsolve(entry->symbolic->S, entry->numeric, n_col, n_rhs, &_x_temp[n], &Common);
@@ -1927,6 +2254,63 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Ret<ffi::Buffer<ffi::DataType::C128>>()  // x
 );
 
+// tsolve_with_numeric_status: as tsolve_with_numeric, plus a per-numeric-handle
+// RebuildReason.
+ffi::Error tsolve_with_numeric_status_f64(
+    const ffi::Buffer<ffi::DataType::S32> Ai,
+    const ffi::Buffer<ffi::DataType::S32> Aj,
+    const ffi::Buffer<ffi::DataType::F64> Ax,
+    const ffi::Buffer<ffi::DataType::U64> symbolic,
+    const ffi::Buffer<ffi::DataType::U64> numeric,
+    const ffi::Buffer<ffi::DataType::F64> b,
+    ffi::Result<ffi::Buffer<ffi::DataType::F64>> x,
+    ffi::Result<ffi::Buffer<ffi::DataType::S32>> out_rebuild) {
+    return tsolve_with_numeric_impl<double>(Ai, Aj, Ax.dimensions(), b.dimensions(), x->dimensions(),
+                                            symbolic, numeric, Ax.typed_data(), b.typed_data(),
+                                            x->typed_data(), out_rebuild->typed_data());
+}
+
+ffi::Error tsolve_with_numeric_status_c128(
+    const ffi::Buffer<ffi::DataType::S32> Ai,
+    const ffi::Buffer<ffi::DataType::S32> Aj,
+    const ffi::Buffer<ffi::DataType::C128> Ax,
+    const ffi::Buffer<ffi::DataType::U64> symbolic,
+    const ffi::Buffer<ffi::DataType::U64> numeric,
+    const ffi::Buffer<ffi::DataType::C128> b,
+    ffi::Result<ffi::Buffer<ffi::DataType::C128>> x,
+    ffi::Result<ffi::Buffer<ffi::DataType::S32>> out_rebuild) {
+    return tsolve_with_numeric_impl<Complex>(Ai, Aj, Ax.dimensions(), b.dimensions(), x->dimensions(),
+                                             symbolic, numeric,
+                                             reinterpret_cast<const Complex*>(Ax.typed_data()),
+                                             reinterpret_cast<const Complex*>(b.typed_data()),
+                                             reinterpret_cast<Complex*>(x->typed_data()),
+                                             out_rebuild->typed_data());
+}
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    tsolve_with_numeric_status_f64_handler, tsolve_with_numeric_status_f64,
+    ffi::Ffi::Bind()
+        .Arg<ffi::Buffer<ffi::DataType::S32>>()  // Ai
+        .Arg<ffi::Buffer<ffi::DataType::S32>>()  // Aj
+        .Arg<ffi::Buffer<ffi::DataType::F64>>()  // Ax
+        .Arg<ffi::Buffer<ffi::DataType::U64>>()  // symbolic
+        .Arg<ffi::Buffer<ffi::DataType::U64>>()  // numeric
+        .Arg<ffi::Buffer<ffi::DataType::F64>>()  // b
+        .Ret<ffi::Buffer<ffi::DataType::F64>>()  // x
+        .Ret<ffi::Buffer<ffi::DataType::S32>>());  // out_rebuild (per numeric handle)
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    tsolve_with_numeric_status_c128_handler, tsolve_with_numeric_status_c128,
+    ffi::Ffi::Bind()
+        .Arg<ffi::Buffer<ffi::DataType::S32>>()   // Ai
+        .Arg<ffi::Buffer<ffi::DataType::S32>>()   // Aj
+        .Arg<ffi::Buffer<ffi::DataType::C128>>()  // Ax
+        .Arg<ffi::Buffer<ffi::DataType::U64>>()   // symbolic
+        .Arg<ffi::Buffer<ffi::DataType::U64>>()   // numeric
+        .Arg<ffi::Buffer<ffi::DataType::C128>>()  // b
+        .Ret<ffi::Buffer<ffi::DataType::C128>>()  // x
+        .Ret<ffi::Buffer<ffi::DataType::S32>>());  // out_rebuild (per numeric handle)
+
 // Freeing now just drops the cache entry, which frees its KLU objects. It is
 // never required: a later use of the id rebuilds it. An unknown id is a no-op.
 // ordering is an unused operand that only gives XLA a data dependency, so a
@@ -1941,7 +2325,7 @@ ffi::Error free_numeric(
     const uint64_t* _numeric = numeric.typed_data();
     auto& r = CacheRegistry::instance();
     for (int i = 0; i < n; i++) {
-        if (_numeric[i] != 0) r.erase(_numeric[i]);
+        if (_numeric[i] != 0) r.erase(_numeric[i], RebuildReason::FREED);
     }
     // returning value so function can be traced
     *status->typed_data() = 1;
@@ -1961,7 +2345,7 @@ ffi::Error free_symbolic(
         *status->typed_data() = 0;  // 0 = nothing to free
         return ffi::Error::Success();
     }
-    CacheRegistry::instance().erase(sym_id);
+    CacheRegistry::instance().erase(sym_id, RebuildReason::FREED);
     // returning value so function can be traced
     *status->typed_data() = 1;
     return ffi::Error::Success();
@@ -2018,7 +2402,7 @@ ffi::Error analyze(
     }
     auto entry = std::make_shared<CacheEntry>();
     entry->symbolic = sym;
-    *symbolic->typed_data() = CacheRegistry::instance().insert(entry);
+    *symbolic->typed_data() = CacheRegistry::instance().insert(entry, sym->key);
     return ffi::Error::Success();
 }
 
@@ -2061,6 +2445,14 @@ PYBIND11_MODULE(klujax_cpp, m) {
           []() { return py::capsule((void*)&tsolve_with_numeric_f64_handler); });
     m.def("tsolve_with_numeric_c128",
           []() { return py::capsule((void*)&tsolve_with_numeric_c128_handler); });
+    m.def("solve_with_numeric_status_f64",
+          []() { return py::capsule((void*)&solve_with_numeric_status_f64_handler); });
+    m.def("solve_with_numeric_status_c128",
+          []() { return py::capsule((void*)&solve_with_numeric_status_c128_handler); });
+    m.def("tsolve_with_numeric_status_f64",
+          []() { return py::capsule((void*)&tsolve_with_numeric_status_f64_handler); });
+    m.def("tsolve_with_numeric_status_c128",
+          []() { return py::capsule((void*)&tsolve_with_numeric_status_c128_handler); });
     m.def("free_numeric",
           []() { return py::capsule((void*)&free_numeric_handler); });
     m.def("analyze",
@@ -2096,5 +2488,16 @@ PYBIND11_MODULE(klujax_cpp, m) {
     m.def("rebuild_count",
           []() { return (long)CacheRegistry::instance().rebuilds.load(); });
     m.def("reset_rebuild_count",
-          []() { CacheRegistry::instance().rebuilds.store(0); });
+          []() {
+              auto& r = CacheRegistry::instance();
+              r.rebuilds.store(0);
+              for (auto& c : r.reason_counts) c.store(0);
+          });
+    // Count of rebuilds recorded for a single RebuildReason (see RebuildReason
+    // in klujax.py). Lets rebuild_stats() report a per-reason breakdown.
+    m.def("rebuild_reason_count", [](int reason) {
+        auto& r = CacheRegistry::instance();
+        if (reason < 0 || reason >= kNumRebuildReasons) return (long)0;
+        return (long)r.reason_counts[reason].load();
+    });
 }
