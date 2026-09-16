@@ -1170,8 +1170,9 @@ def test_forgotten_handles_are_bounded_and_rebuild(monkeypatch):
     sym = klujax.analyze(Ai, Aj, n_col)
 
     first = klujax.factor(Ai, Aj, Ax, sym)
-    for _ in range(5):
-        klujax.factor(Ai, Aj, Ax, sym)  # evicts older entries, first included
+    for i in range(5):
+        # evicts older entries, first included
+        klujax.factor(Ai, Aj, Ax * (i + 2.0), sym)
 
     klujax.reset_rebuild_count()
     x = klujax.solve_with_numeric(first, b, sym)
@@ -1196,7 +1197,7 @@ def test_strict_mode_turns_a_rebuild_into_an_error(monkeypatch):
     Ai, Aj, Ax, b = _get_rand_arrs_1d(15, (n_col := 5), dtype=np.float64)
     sym = klujax.analyze(Ai, Aj, n_col)
     first = klujax.factor(Ai, Aj, Ax, sym)
-    klujax.factor(Ai, Aj, Ax, sym)  # evicts first
+    klujax.factor(Ai, Aj, Ax * 2.0, sym)  # evicts first
 
     with pytest.raises(Exception, match="strict cache mode"):
         klujax.solve_with_numeric(first, b, sym)
@@ -1258,7 +1259,7 @@ def test_eager_factor_then_jitted_solve_self_heals(monkeypatch):
     Ai, Aj, Ax, b = _get_rand_arrs_1d(15, (n_col := 5), dtype=np.float64)
     sym = klujax.analyze(Ai, Aj, n_col)
     num = klujax.factor(Ai, Aj, Ax, sym)
-    klujax.factor(Ai, Aj, Ax, sym)  # evicts num (capacity 1)
+    klujax.factor(Ai, Aj, Ax * 2.0, sym)  # evicts num (capacity 1)
 
     @jax.jit
     def solve(b):
