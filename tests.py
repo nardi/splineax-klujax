@@ -833,7 +833,7 @@ def test_refactor_with_status_ok(dtype, mode):
     num = klujax.factor(Ai, Aj, Ax, sym)
 
     def f(ax):
-        _, status = klujax.refactor_with_status(Ai, Aj, ax, num, sym)
+        _, status, _ = klujax.refactor_with_status(Ai, Aj, ax, num, sym)
         return status
 
     status = _run(mode, f, Ax)
@@ -858,7 +858,7 @@ def test_refactor_with_status_singular(dtype, mode):
     num = klujax.factor(Ai, Aj, Ax, sym)
 
     def f(ax):
-        _, status = klujax.refactor_with_status(Ai, Aj, ax, num, sym)
+        _, status, _ = klujax.refactor_with_status(Ai, Aj, ax, num, sym)
         return status
 
     status = _run(mode, f, Ax_singular)
@@ -883,7 +883,7 @@ def test_refactor_with_status_branch_under_jit(dtype):
 
     @jax.jit
     def f(ax):
-        num2, status = klujax.refactor_with_status(Ai, Aj, ax, num, sym)
+        num2, status, _ = klujax.refactor_with_status(Ai, Aj, ax, num, sym)
         x = klujax.solve_with_numeric(num2, b, sym)
         # on failure, report a zero solution instead of the unusable factorization
         return lax.cond(
@@ -909,7 +909,7 @@ def test_factor_after_singular_status(dtype):
     sym = klujax.analyze(Ai, Aj, 2)
     num = klujax.factor(Ai, Aj, Ax, sym)
 
-    _, status = klujax.refactor_with_status(Ai, Aj, Ax_singular, num, sym)
+    _, status, _ = klujax.refactor_with_status(Ai, Aj, Ax_singular, num, sym)
     assert status.tolist() == [klujax.KLUStatus.SINGULAR]
 
     klujax.free_numeric(num)
@@ -933,7 +933,7 @@ def test_refactor_with_status_batched(dtype, mode):
     num = klujax.factor(Ai, Aj, Ax, sym)
 
     def f(ax):
-        _, status = klujax.refactor_with_status(Ai, Aj, ax, num, sym)
+        _, status, _ = klujax.refactor_with_status(Ai, Aj, ax, num, sym)
         return status
 
     # only the last left-hand side is singular, the rest still refactor fine
@@ -959,7 +959,7 @@ def test_refactor_with_status_vmap(dtype, mode):
     Ax_batched = jnp.stack([Ax] * (batch - 1) + [Ax_singular])
 
     def f(ax):
-        _, status = klujax.refactor_with_status(Ai, Aj, ax, num, sym)
+        _, status, _ = klujax.refactor_with_status(Ai, Aj, ax, num, sym)
         return status
 
     status = _run(mode, jax.vmap(f), Ax_batched)
@@ -982,7 +982,7 @@ def test_refactor_and_solve_with_status(dtype, mode):
     # every case and (under jit) has to work with a traced handle.
     def f(ax):
         num = klujax.factor(Ai, Aj, Ax, sym)
-        x, _, status = klujax.refactor_and_solve_with_status(Ai, Aj, ax, b, num, sym)
+        x, _, status, _ = klujax.refactor_and_solve_with_status(Ai, Aj, ax, b, num, sym)
         num = num.track(x)
         klujax.free_numeric(num)
         return x, status
@@ -1482,3 +1482,138 @@ def test_many_solves_in_a_vmap_then_free():
     A = _dense(Ai, Aj, Ax, n_col, np.float64)
     _log_and_test_equality(jax.vmap(lambda bb: jsp.linalg.solve(A, bb))(bs), xs)
     klujax.free_symbolic(sym)
+
+
+# Factorization safety: content-addressed handles + rebuild visibility ================
+
+
+@log_test_name
+@parametrize_dtypes
+def test_alias_refactor_supersedes(dtype):
+    """A refactor through one token cannot corrupt a stale alias of the old handle.
+
+    factor -> hand the token to two places -> one refactors (re-keying the handle) ->
+    the other still solves through the original token. Because a handle is a content
+    key, the alias names the original matrix and rebuilds it, so it can never be handed
+    the refactored values. The rebuild is visible as RebuildReason.SUPERSEDED.
+    """
+    Ai, Aj, Ax, b = _get_rand_arrs_1d(15, (n_col := 5), dtype=dtype)
+    Ax2 = Ax * 2.0
+    sym = klujax.analyze(Ai, Aj, n_col)
+    num = klujax.factor(Ai, Aj, Ax, sym)
+
+    # One consumer refactors to new values (re-keys the handle in the cache).
+    klujax.refactor(Ai, Aj, Ax2, num, sym)
+
+    # The other consumer still holds the original token and solves through it.
+    x, rebuild = klujax.solve_with_numeric_with_status(num, b, sym)
+
+    assert int(rebuild[0]) == int(klujax.RebuildReason.SUPERSEDED)
+    # The answer must be the ORIGINAL matrix's solution, not the refactored one.
+    _log_and_test_equality(jsp.linalg.solve(_dense(Ai, Aj, Ax, n_col, dtype), b), x)
+
+
+@log_test_name
+@parametrize_dtypes
+def test_residency_does_not_change_the_answer(dtype, monkeypatch):
+    """Solving a handle gives the same answer resident and after eviction.
+
+    Correctness must not depend on whether the factorization happens to still be in
+    the bounded cache. A resident solve reports NONE; the same handle after forced
+    eviction reports EVICTED and returns the identical result.
+    """
+    monkeypatch.setenv("KLUJAX_FACTOR_CACHE", "2")
+    Ai, Aj, Ax, b = _get_rand_arrs_1d(15, (n_col := 5), dtype=dtype)
+    sym = klujax.analyze(Ai, Aj, n_col)
+    num = klujax.factor(Ai, Aj, Ax, sym)
+
+    x_resident, r_resident = klujax.solve_with_numeric_with_status(num, b, sym)
+    assert int(r_resident[0]) == int(klujax.RebuildReason.NONE)
+
+    # Churn other factorizations to evict `num` from the size-2 cache.
+    for _ in range(5):
+        klujax.factor(Ai, Aj, Ax * 3.0, sym)
+
+    x_evicted, r_evicted = klujax.solve_with_numeric_with_status(num, b, sym)
+    assert int(r_evicted[0]) == int(klujax.RebuildReason.EVICTED)
+    _log_and_test_equality(x_resident, x_evicted)
+
+
+@log_test_name
+@parametrize_dtypes
+def test_freed_handle_reports_freed(dtype):
+    """A solve through an explicitly freed handle reports RebuildReason.FREED."""
+    Ai, Aj, Ax, b = _get_rand_arrs_1d(15, (n_col := 5), dtype=dtype)
+    sym = klujax.analyze(Ai, Aj, n_col)
+    num = klujax.factor(Ai, Aj, Ax, sym)
+    klujax.free_numeric(num)
+
+    x, rebuild = klujax.solve_with_numeric_with_status(num, b, sym)
+    assert int(rebuild[0]) == int(klujax.RebuildReason.FREED)
+    _log_and_test_equality(jsp.linalg.solve(_dense(Ai, Aj, Ax, n_col, dtype), b), x)
+
+
+@log_test_name
+@parametrize_dtypes
+def test_identical_factor_deduplicates(dtype):
+    """Factoring the same matrix twice reuses one factorization (same content key)."""
+    Ai, Aj, Ax, _ = _get_rand_arrs_1d(15, (n_col := 5), dtype=dtype)
+    sym = klujax.analyze(Ai, Aj, n_col)
+    num1 = klujax.factor(Ai, Aj, Ax, sym)
+    num2 = klujax.factor(Ai, Aj, Ax, sym)
+    # Content-addressed: identical matrices map to the same handle.
+    assert int(num1.id[0]) == int(num2.id[0])
+    # A different matrix gets a different handle.
+    num3 = klujax.factor(Ai, Aj, Ax * 2.0, sym)
+    assert int(num3.id[0]) != int(num1.id[0])
+
+
+@log_test_name
+def test_complex_numeric_real_rhs_dispatches_complex():
+    """A complex factorization solved with a real b uses the complex entry point.
+
+    The KLU entry point must follow the factorization's dtype, not b's. A real solve
+    would otherwise reinterpret a complex numeric's memory. The answer must match a
+    dense complex solve.
+    """
+    Ai, Aj, Ax, _ = _get_rand_arrs_1d(15, (n_col := 5), dtype=np.complex128)
+    b_real = jax.random.normal(jax.random.PRNGKey(7), (n_col,), dtype=np.float64)
+    sym = klujax.analyze(Ai, Aj, n_col)
+    num = klujax.factor(Ai, Aj, Ax, sym)
+    x = klujax.solve_with_numeric(num, b_real, sym)
+    A = _dense(Ai, Aj, Ax, n_col, np.complex128)
+    _log_and_test_equality(jsp.linalg.solve(A, b_real.astype(np.complex128)), x)
+
+
+@log_test_name
+def test_rebuild_reason_visible_under_jit():
+    """The rebuild reason is an ordinary output, so it can be branched on under jit."""
+    Ai, Aj, Ax, b = _get_rand_arrs_1d(15, (n_col := 5), dtype=np.float64)
+    sym = klujax.analyze(Ai, Aj, n_col)
+    num = klujax.factor(Ai, Aj, Ax, sym)
+    klujax.free_numeric(num)
+
+    @jax.jit
+    def solved_and_was_rebuilt(num, b):
+        x, rebuild = klujax.solve_with_numeric_with_status(num, b, sym)
+        return x, rebuild[0] != jnp.int32(klujax.RebuildReason.NONE)
+
+    x, was_rebuilt = solved_and_was_rebuilt(num, b)
+    assert bool(was_rebuilt)
+    _log_and_test_equality(
+        jsp.linalg.solve(_dense(Ai, Aj, Ax, n_col, np.float64), b), x
+    )
+
+
+@log_test_name
+def test_rebuild_stats_breakdown():
+    """rebuild_stats() attributes rebuilds to the right RebuildReason."""
+    Ai, Aj, Ax, b = _get_rand_arrs_1d(15, (n_col := 5), dtype=np.float64)
+    sym = klujax.analyze(Ai, Aj, n_col)
+    num = klujax.factor(Ai, Aj, Ax, sym)
+    klujax.free_numeric(num)
+
+    klujax.reset_rebuild_count()
+    klujax.solve_with_numeric(num, b, sym)
+    stats = klujax.rebuild_stats()
+    assert stats[klujax.RebuildReason.FREED] >= 1

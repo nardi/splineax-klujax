@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Handles are now content-addressed. A handle hashes the matrix it names (dtype, sparsity pattern, values) instead of naming a mutable cache slot, so a stale alias can never be handed the wrong matrix. At worst it rebuilds, and identical matrices dedup to one factorization.
+- `refactor` and `refactor_and_solve` re-key to the new values instead of overwriting the old handle in place. They still reuse pivots via `klu_refactor` when safe, and the returned handle is a new content key.
+- Fix a dtype-dispatch bug where `solve_with_numeric` and `tsolve_with_numeric` chose the KLU entry point from `b` alone. They now use the factorization's dtype, so a complex factorization solved with a real right-hand side no longer down-casts.
+- Add `RebuildReason` and per-call rebuild visibility: `solve_with_numeric_with_status` and `tsolve_with_numeric_with_status` return a per-handle `RebuildReason` you can branch on under `jax.jit`, and `rebuild_stats()` returns the per-reason totals.
+- **Breaking:** `refactor_with_status` now returns `(numeric, status, rebuild)` and `refactor_and_solve_with_status` returns `(x, numeric, status, rebuild)`.
+
 ## 0.5.0.post6
 
 - Mark factor as side-effecting so slots stay distinct
