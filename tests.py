@@ -1528,6 +1528,65 @@ def test_freed_handle_reports_freed(dtype):
 
 @log_test_name
 @parametrize_dtypes
+def test_solve_with_symbol_with_status_reports_reason(dtype):
+    """solve_with_symbol_with_status reports NONE resident and FREED after a free.
+
+    The rebuild reason says whether the symbolic analysis handle was resident: a hit
+    reports NONE, and after free_symbolic the next solve rebuilds the analysis from
+    the carried Ai/Aj and reports FREED. The answer is correct either way.
+    """
+    Ai, Aj, Ax, b = _get_rand_arrs_1d(15, (n_col := 5), dtype=dtype)
+    sym = klujax.analyze(Ai, Aj, n_col)
+    expected = jsp.linalg.solve(_dense(Ai, Aj, Ax, n_col, dtype), b)
+
+    x, reason = klujax.solve_with_symbol_with_status(Ai, Aj, Ax, b, sym)
+    assert int(reason) == int(klujax.RebuildReason.NONE)
+    _log_and_test_equality(expected, x)
+
+    klujax.free_symbolic(sym)
+    x_freed, reason_freed = klujax.solve_with_symbol_with_status(Ai, Aj, Ax, b, sym)
+    assert int(reason_freed) == int(klujax.RebuildReason.FREED)
+    _log_and_test_equality(expected, x_freed)
+
+    xt, reason_t = klujax.tsolve_with_symbol_with_status(Ai, Aj, Ax, b, sym)
+    expected_t = jsp.linalg.solve(_dense(Ai, Aj, Ax, n_col, dtype).T, b)
+    _log_and_test_equality(expected_t, xt)
+    assert int(reason_t) in {int(r) for r in klujax.RebuildReason}
+
+
+@log_test_name
+@parametrize_dtypes
+def test_refactor_result_is_residency_independent(dtype, monkeypatch):
+    """A refactored handle solves the same whether its analysis is resident or gone.
+
+    When a refactor handle misses and its parent analysis is evicted, it rebuilds with
+    a fresh factor rather than replaying the pivot reuse. The solved answer must match
+    the resident case to working precision, so the fresh-factor fallback is safe.
+    """
+    monkeypatch.setenv("KLUJAX_FACTOR_CACHE", "2")
+    Ai, Aj, Ax, b = _get_rand_arrs_1d(15, (n_col := 5), dtype=dtype)
+    Ax2 = Ax * 2.0
+    sym = klujax.analyze(Ai, Aj, n_col)
+    num = klujax.factor(Ai, Aj, Ax, sym)
+    num2 = klujax.refactor(Ai, Aj, Ax2, num, sym)
+
+    x_resident, r_resident = klujax.solve_with_numeric_with_status(num2, b, sym)
+    assert int(r_resident[0]) == int(klujax.RebuildReason.NONE)
+
+    # Churn other factorizations to evict num2 and its analysis from the size-2 cache.
+    for _ in range(5):
+        klujax.factor(Ai, Aj, Ax * 7.0, sym)
+
+    x_evicted, r_evicted = klujax.solve_with_numeric_with_status(num2, b, sym)
+    assert int(r_evicted[0]) != int(klujax.RebuildReason.NONE)
+    _log_and_test_equality(x_resident, x_evicted)
+    _log_and_test_equality(
+        jsp.linalg.solve(_dense(Ai, Aj, Ax2, n_col, dtype), b), x_evicted
+    )
+
+
+@log_test_name
+@parametrize_dtypes
 def test_identical_factor_deduplicates(dtype):
     """Factoring the same matrix twice reuses one factorization (same content key)."""
     Ai, Aj, Ax, _ = _get_rand_arrs_1d(15, (n_col := 5), dtype=dtype)

@@ -898,7 +898,8 @@ ffi::Error solve_with_symbol_impl(
     const ffi::Buffer<ffi::DataType::U64>& symbolic,
     const T* _Ax,
     const T* _b,
-    T* _x) {
+    T* _x,
+    int32_t* out_rebuild = nullptr) {
     if (symbolic.element_count() != 1) return ffi::Error::InvalidArgument("symbolic must be scalar");
     uint64_t sym_id = *symbolic.typed_data();
 
@@ -915,8 +916,12 @@ ffi::Error solve_with_symbol_impl(
     const int* _Aj = Aj.typed_data();
 
     // Resolve the analysis by id, rebuilding it from Ai/Aj if it was evicted.
-    auto _sym = resolve_symbolic(sym_id, _Ai, _Aj, n_nz, n_col, err);
+    // Only one symbolic handle exists per call, unlike the numeric handles (one
+    // per left-hand side), so its rebuild reason is a single scalar, not an array.
+    RebuildReason sym_reason = RebuildReason::NONE;
+    auto _sym = resolve_symbolic(sym_id, _Ai, _Aj, n_nz, n_col, err, &sym_reason);
     if (!_sym) return err;
+    if (out_rebuild != nullptr) *out_rebuild = (int32_t)sym_reason;
     klu_symbolic* Symbolic = _sym->S;
 
     // get COO -> CSC transformation information (using RAII for automatic cleanup)
@@ -1039,7 +1044,8 @@ ffi::Error tsolve_with_symbol_impl(
     const ffi::Buffer<ffi::DataType::U64>& symbolic,
     const T* _Ax,
     const T* _b,
-    T* _x) {
+    T* _x,
+    int32_t* out_rebuild = nullptr) {
     if (symbolic.element_count() != 1) return ffi::Error::InvalidArgument("symbolic must be scalar");
     uint64_t sym_id = *symbolic.typed_data();
 
@@ -1056,8 +1062,12 @@ ffi::Error tsolve_with_symbol_impl(
     const int* _Aj = Aj.typed_data();
 
     // Resolve the analysis by id, rebuilding it from Ai/Aj if it was evicted.
-    auto _sym = resolve_symbolic(sym_id, _Ai, _Aj, n_nz, n_col, err);
+    // Only one symbolic handle exists per call, unlike the numeric handles (one
+    // per left-hand side), so its rebuild reason is a single scalar, not an array.
+    RebuildReason sym_reason = RebuildReason::NONE;
+    auto _sym = resolve_symbolic(sym_id, _Ai, _Aj, n_nz, n_col, err, &sym_reason);
     if (!_sym) return err;
+    if (out_rebuild != nullptr) *out_rebuild = (int32_t)sym_reason;
     klu_symbolic* Symbolic = _sym->S;
 
     auto _Bk = std::make_unique<int[]>(n_nz);
@@ -1165,6 +1175,109 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<ffi::Buffer<ffi::DataType::U64>>()   // symbolic
         .Ret<ffi::Buffer<ffi::DataType::C128>>()  // x
 );
+
+// solve_with_symbol_status / tsolve_with_symbol_status: as the plain variants,
+// plus a scalar RebuildReason saying whether the symbolic analysis was reused or
+// rebuilt from the carried Ai/Aj.
+ffi::Error solve_with_symbol_status_f64(
+    const ffi::Buffer<ffi::DataType::S32> Ai,
+    const ffi::Buffer<ffi::DataType::S32> Aj,
+    const ffi::Buffer<ffi::DataType::F64> Ax,
+    const ffi::Buffer<ffi::DataType::F64> b,
+    const ffi::Buffer<ffi::DataType::U64> symbolic,
+    ffi::Result<ffi::Buffer<ffi::DataType::F64>> x,
+    ffi::Result<ffi::Buffer<ffi::DataType::S32>> out_rebuild) {
+    return solve_with_symbol_impl<double>(Ai, Aj, Ax.dimensions(), b.dimensions(), symbolic,
+                                          Ax.typed_data(), b.typed_data(), x->typed_data(),
+                                          out_rebuild->typed_data());
+}
+
+ffi::Error solve_with_symbol_status_c128(
+    const ffi::Buffer<ffi::DataType::S32> Ai,
+    const ffi::Buffer<ffi::DataType::S32> Aj,
+    const ffi::Buffer<ffi::DataType::C128> Ax,
+    const ffi::Buffer<ffi::DataType::C128> b,
+    const ffi::Buffer<ffi::DataType::U64> symbolic,
+    ffi::Result<ffi::Buffer<ffi::DataType::C128>> x,
+    ffi::Result<ffi::Buffer<ffi::DataType::S32>> out_rebuild) {
+    return solve_with_symbol_impl<Complex>(Ai, Aj, Ax.dimensions(), b.dimensions(), symbolic,
+                                           reinterpret_cast<const Complex*>(Ax.typed_data()),
+                                           reinterpret_cast<const Complex*>(b.typed_data()),
+                                           reinterpret_cast<Complex*>(x->typed_data()),
+                                           out_rebuild->typed_data());
+}
+
+ffi::Error tsolve_with_symbol_status_f64(
+    const ffi::Buffer<ffi::DataType::S32> Ai,
+    const ffi::Buffer<ffi::DataType::S32> Aj,
+    const ffi::Buffer<ffi::DataType::F64> Ax,
+    const ffi::Buffer<ffi::DataType::F64> b,
+    const ffi::Buffer<ffi::DataType::U64> symbolic,
+    ffi::Result<ffi::Buffer<ffi::DataType::F64>> x,
+    ffi::Result<ffi::Buffer<ffi::DataType::S32>> out_rebuild) {
+    return tsolve_with_symbol_impl<double>(Ai, Aj, Ax.dimensions(), b.dimensions(), symbolic,
+                                           Ax.typed_data(), b.typed_data(), x->typed_data(),
+                                           out_rebuild->typed_data());
+}
+
+ffi::Error tsolve_with_symbol_status_c128(
+    const ffi::Buffer<ffi::DataType::S32> Ai,
+    const ffi::Buffer<ffi::DataType::S32> Aj,
+    const ffi::Buffer<ffi::DataType::C128> Ax,
+    const ffi::Buffer<ffi::DataType::C128> b,
+    const ffi::Buffer<ffi::DataType::U64> symbolic,
+    ffi::Result<ffi::Buffer<ffi::DataType::C128>> x,
+    ffi::Result<ffi::Buffer<ffi::DataType::S32>> out_rebuild) {
+    return tsolve_with_symbol_impl<Complex>(Ai, Aj, Ax.dimensions(), b.dimensions(), symbolic,
+                                            reinterpret_cast<const Complex*>(Ax.typed_data()),
+                                            reinterpret_cast<const Complex*>(b.typed_data()),
+                                            reinterpret_cast<Complex*>(x->typed_data()),
+                                            out_rebuild->typed_data());
+}
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    solve_with_symbol_status_f64_handler, solve_with_symbol_status_f64,
+    ffi::Ffi::Bind()
+        .Arg<ffi::Buffer<ffi::DataType::S32>>()    // Ai
+        .Arg<ffi::Buffer<ffi::DataType::S32>>()    // Aj
+        .Arg<ffi::Buffer<ffi::DataType::F64>>()    // Ax
+        .Arg<ffi::Buffer<ffi::DataType::F64>>()    // b
+        .Arg<ffi::Buffer<ffi::DataType::U64>>()    // symbolic
+        .Ret<ffi::Buffer<ffi::DataType::F64>>()    // x
+        .Ret<ffi::Buffer<ffi::DataType::S32>>());  // out_rebuild (scalar)
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    solve_with_symbol_status_c128_handler, solve_with_symbol_status_c128,
+    ffi::Ffi::Bind()
+        .Arg<ffi::Buffer<ffi::DataType::S32>>()    // Ai
+        .Arg<ffi::Buffer<ffi::DataType::S32>>()    // Aj
+        .Arg<ffi::Buffer<ffi::DataType::C128>>()   // Ax
+        .Arg<ffi::Buffer<ffi::DataType::C128>>()   // b
+        .Arg<ffi::Buffer<ffi::DataType::U64>>()    // symbolic
+        .Ret<ffi::Buffer<ffi::DataType::C128>>()   // x
+        .Ret<ffi::Buffer<ffi::DataType::S32>>());  // out_rebuild (scalar)
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    tsolve_with_symbol_status_f64_handler, tsolve_with_symbol_status_f64,
+    ffi::Ffi::Bind()
+        .Arg<ffi::Buffer<ffi::DataType::S32>>()    // Ai
+        .Arg<ffi::Buffer<ffi::DataType::S32>>()    // Aj
+        .Arg<ffi::Buffer<ffi::DataType::F64>>()    // Ax
+        .Arg<ffi::Buffer<ffi::DataType::F64>>()    // b
+        .Arg<ffi::Buffer<ffi::DataType::U64>>()    // symbolic
+        .Ret<ffi::Buffer<ffi::DataType::F64>>()    // x
+        .Ret<ffi::Buffer<ffi::DataType::S32>>());  // out_rebuild (scalar)
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    tsolve_with_symbol_status_c128_handler, tsolve_with_symbol_status_c128,
+    ffi::Ffi::Bind()
+        .Arg<ffi::Buffer<ffi::DataType::S32>>()    // Ai
+        .Arg<ffi::Buffer<ffi::DataType::S32>>()    // Aj
+        .Arg<ffi::Buffer<ffi::DataType::C128>>()   // Ax
+        .Arg<ffi::Buffer<ffi::DataType::C128>>()   // b
+        .Arg<ffi::Buffer<ffi::DataType::U64>>()    // symbolic
+        .Ret<ffi::Buffer<ffi::DataType::C128>>()   // x
+        .Ret<ffi::Buffer<ffi::DataType::S32>>());  // out_rebuild (scalar)
 
 template <typename T>
 ffi::Error factor_impl(
@@ -2454,6 +2567,14 @@ PYBIND11_MODULE(klujax_cpp, m) {
           []() { return py::capsule((void*)&tsolve_with_symbol_f64_handler); });
     m.def("tsolve_with_symbol_c128",
           []() { return py::capsule((void*)&tsolve_with_symbol_c128_handler); });
+    m.def("solve_with_symbol_status_f64",
+          []() { return py::capsule((void*)&solve_with_symbol_status_f64_handler); });
+    m.def("solve_with_symbol_status_c128",
+          []() { return py::capsule((void*)&solve_with_symbol_status_c128_handler); });
+    m.def("tsolve_with_symbol_status_f64",
+          []() { return py::capsule((void*)&tsolve_with_symbol_status_f64_handler); });
+    m.def("tsolve_with_symbol_status_c128",
+          []() { return py::capsule((void*)&tsolve_with_symbol_status_c128_handler); });
     m.def("factor_f64",
           []() { return py::capsule((void*)&factor_f64_handler); });
     m.def("factor_c128",

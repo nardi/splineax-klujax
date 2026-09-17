@@ -28,9 +28,11 @@ __all__ = [
     "solve_with_numeric",
     "solve_with_numeric_with_status",
     "solve_with_symbol",
+    "solve_with_symbol_with_status",
     "tsolve_with_numeric",
     "tsolve_with_numeric_with_status",
     "tsolve_with_symbol",
+    "tsolve_with_symbol_with_status",
 ]
 
 # Imports =============================================================================
@@ -625,6 +627,93 @@ def tsolve_with_symbol(
     _require_x64()
     handle = getattr(symbolic, "handle", symbolic)
     return _tsolve_with_symbol_jit(Ai, Aj, Ax, b, handle)
+
+
+@jax.jit
+def _solve_with_symbol_status_jit(
+    Ai: Array, Aj: Array, Ax: Array, b: Array, sym_h: Array
+) -> tuple[Array, Array]:
+    Ai, Aj, Ax, b, out_shape = validate_numeric_solve(Ai, Aj, Ax, b)
+    is_complex = any(x.dtype in COMPLEX_DTYPES for x in (Ax, b))
+    prim = solve_with_symbol_status_c128 if is_complex else solve_with_symbol_status_f64
+    x, rebuild = prim.bind(
+        Ai.astype(jnp.int32),
+        Aj.astype(jnp.int32),
+        Ax.astype(jnp.complex128 if is_complex else jnp.float64),
+        b.astype(jnp.complex128 if is_complex else jnp.float64),
+        sym_h.astype(jnp.uint64),
+    )
+    return x.reshape(*out_shape), rebuild
+
+
+def solve_with_symbol_with_status(
+    Ai: Array, Aj: Array, Ax: Array, b: Array, symbolic: SymbolToken | Array
+) -> tuple[Array, Array]:
+    """Like solve_with_symbol(), but also reports whether the analysis was rebuilt.
+
+    Returns the solution and a scalar `RebuildReason`. It is `NONE` when the
+    resident symbolic analysis was used, or `EVICTED` / `FREED` / `SUPERSEDED` /
+    `UNKNOWN` when the analysis handle was gone and rebuilt from the carried
+    Ai/Aj. A rebuild is still correct, only costlier. The rebuild value is a
+    plain array returned alongside the solution, not a Python-side attribute,
+    so you can use it in `jax.lax.cond` or similar under `jax.jit`.
+
+    Args:
+        Ai: [n_nz; int32]: the row indices of the sparse matrix A
+        Aj: [n_nz; int32]: the column indices of the sparse matrix A
+        Ax: [n_lhs? x n_nz; float64|complex128]: the values of the sparse matrix A
+        b:  [n_lhs? x n_col x n_rhs?; float64|complex128]: the target vector
+        symbolic: [SymbolToken|Array]: the symbolic analysis handle
+
+    Returns:
+        (x, rebuild): the solution and a scalar RebuildReason value
+
+    """
+    _require_x64()
+    handle = getattr(symbolic, "handle", symbolic)
+    return _solve_with_symbol_status_jit(Ai, Aj, Ax, b, handle)
+
+
+@jax.jit
+def _tsolve_with_symbol_status_jit(
+    Ai: Array, Aj: Array, Ax: Array, b: Array, sym_h: Array
+) -> tuple[Array, Array]:
+    Ai, Aj, Ax, b, out_shape = validate_numeric_solve(Ai, Aj, Ax, b)
+    is_complex = any(x.dtype in COMPLEX_DTYPES for x in (Ax, b))
+    prim = (
+        tsolve_with_symbol_status_c128 if is_complex else tsolve_with_symbol_status_f64
+    )
+    x, rebuild = prim.bind(
+        Ai.astype(jnp.int32),
+        Aj.astype(jnp.int32),
+        Ax.astype(jnp.complex128 if is_complex else jnp.float64),
+        b.astype(jnp.complex128 if is_complex else jnp.float64),
+        sym_h.astype(jnp.uint64),
+    )
+    return x.reshape(*out_shape), rebuild
+
+
+def tsolve_with_symbol_with_status(
+    Ai: Array, Aj: Array, Ax: Array, b: Array, symbolic: SymbolToken | Array
+) -> tuple[Array, Array]:
+    """Like tsolve_with_symbol(), but also reports the analysis rebuild reason.
+
+    See solve_with_symbol_with_status for the RebuildReason meaning.
+
+    Args:
+        Ai: [n_nz; int32]: the row indices of the sparse matrix A
+        Aj: [n_nz; int32]: the column indices of the sparse matrix A
+        Ax: [n_lhs? x n_nz; float64|complex128]: the values of the sparse matrix A
+        b:  [n_lhs? x n_col x n_rhs?; float64|complex128]: the target vector
+        symbolic: [SymbolToken|Array]: the symbolic analysis handle
+
+    Returns:
+        (x, rebuild): the solution and a scalar RebuildReason value
+
+    """
+    _require_x64()
+    handle = getattr(symbolic, "handle", symbolic)
+    return _tsolve_with_symbol_status_jit(Ai, Aj, Ax, b, handle)
 
 
 def _n_col_of(token: SymbolToken | NumericToken | Any) -> int:  # noqa: ANN401
@@ -1226,6 +1315,20 @@ solve_with_symbol_f64 = jax.extend.core.Primitive("solve_with_symbol_f64")
 solve_with_symbol_c128 = jax.extend.core.Primitive("solve_with_symbol_c128")
 tsolve_with_symbol_f64 = jax.extend.core.Primitive("tsolve_with_symbol_f64")
 tsolve_with_symbol_c128 = jax.extend.core.Primitive("tsolve_with_symbol_c128")
+solve_with_symbol_status_f64 = jax.extend.core.Primitive("solve_with_symbol_status_f64")
+solve_with_symbol_status_c128 = jax.extend.core.Primitive(
+    "solve_with_symbol_status_c128"
+)
+tsolve_with_symbol_status_f64 = jax.extend.core.Primitive(
+    "tsolve_with_symbol_status_f64"
+)
+tsolve_with_symbol_status_c128 = jax.extend.core.Primitive(
+    "tsolve_with_symbol_status_c128"
+)
+solve_with_symbol_status_f64.multiple_results = True
+solve_with_symbol_status_c128.multiple_results = True
+tsolve_with_symbol_status_f64.multiple_results = True
+tsolve_with_symbol_status_c128.multiple_results = True
 free_symbolic_p = jax.extend.core.Primitive("free_symbolic")
 factor_f64 = jax.extend.core.Primitive("factor_f64")
 factor_c128 = jax.extend.core.Primitive("factor_c128")
@@ -1336,6 +1439,43 @@ def tsolve_with_symbol_c128_impl(
     Ai: Array, Aj: Array, Ax: Array, b: Array, symbolic: Array
 ) -> Array:
     return general_impl("tsolve_with_symbol_c128", Ai, Aj, Ax, b, symbolic)
+
+
+def _symbol_status_impl(
+    name: str, Ai: Array, Aj: Array, Ax: Array, b: Array, symbolic: Array
+):
+    # As general_impl, but the call also returns a scalar RebuildReason for the
+    # one symbolic handle backing this solve.
+    call = jax.ffi.ffi_call(
+        name,
+        (
+            jax.ShapeDtypeStruct(b.shape, b.dtype),
+            jax.ShapeDtypeStruct((), jnp.int32),
+        ),
+    )
+    return call(Ai, Aj, Ax, b, symbolic)
+
+
+@solve_with_symbol_status_f64.def_impl
+def solve_with_symbol_status_f64_impl(Ai, Aj, Ax, b, symbolic):
+    return _symbol_status_impl("solve_with_symbol_status_f64", Ai, Aj, Ax, b, symbolic)
+
+
+@solve_with_symbol_status_c128.def_impl
+def solve_with_symbol_status_c128_impl(Ai, Aj, Ax, b, symbolic):
+    return _symbol_status_impl("solve_with_symbol_status_c128", Ai, Aj, Ax, b, symbolic)
+
+
+@tsolve_with_symbol_status_f64.def_impl
+def tsolve_with_symbol_status_f64_impl(Ai, Aj, Ax, b, symbolic):
+    return _symbol_status_impl("tsolve_with_symbol_status_f64", Ai, Aj, Ax, b, symbolic)
+
+
+@tsolve_with_symbol_status_c128.def_impl
+def tsolve_with_symbol_status_c128_impl(Ai, Aj, Ax, b, symbolic):
+    return _symbol_status_impl(
+        "tsolve_with_symbol_status_c128", Ai, Aj, Ax, b, symbolic
+    )
 
 
 @analyze_p.def_impl
@@ -1671,6 +1811,48 @@ tsolve_with_symbol_c128_low = mlir.lower_fun(
 mlir.register_lowering(tsolve_with_symbol_c128, tsolve_with_symbol_c128_low)
 
 jax.ffi.register_ffi_target(
+    "solve_with_symbol_status_f64",
+    klujax_cpp.solve_with_symbol_status_f64(),
+    platform="cpu",
+)
+solve_with_symbol_status_f64_low = mlir.lower_fun(
+    solve_with_symbol_status_f64_impl, multiple_results=True
+)
+mlir.register_lowering(solve_with_symbol_status_f64, solve_with_symbol_status_f64_low)
+
+jax.ffi.register_ffi_target(
+    "solve_with_symbol_status_c128",
+    klujax_cpp.solve_with_symbol_status_c128(),
+    platform="cpu",
+)
+solve_with_symbol_status_c128_low = mlir.lower_fun(
+    solve_with_symbol_status_c128_impl, multiple_results=True
+)
+mlir.register_lowering(solve_with_symbol_status_c128, solve_with_symbol_status_c128_low)
+
+jax.ffi.register_ffi_target(
+    "tsolve_with_symbol_status_f64",
+    klujax_cpp.tsolve_with_symbol_status_f64(),
+    platform="cpu",
+)
+tsolve_with_symbol_status_f64_low = mlir.lower_fun(
+    tsolve_with_symbol_status_f64_impl, multiple_results=True
+)
+mlir.register_lowering(tsolve_with_symbol_status_f64, tsolve_with_symbol_status_f64_low)
+
+jax.ffi.register_ffi_target(
+    "tsolve_with_symbol_status_c128",
+    klujax_cpp.tsolve_with_symbol_status_c128(),
+    platform="cpu",
+)
+tsolve_with_symbol_status_c128_low = mlir.lower_fun(
+    tsolve_with_symbol_status_c128_impl, multiple_results=True
+)
+mlir.register_lowering(
+    tsolve_with_symbol_status_c128, tsolve_with_symbol_status_c128_low
+)
+
+jax.ffi.register_ffi_target(
     "free_symbolic",
     klujax_cpp.free_symbolic(),
     platform="cpu",
@@ -1965,6 +2147,18 @@ def solve_with_numeric_status_abstract_eval(Ai, Aj, Ax, symbolic, numeric, b):
     )
 
 
+@solve_with_symbol_status_f64.def_abstract_eval
+@solve_with_symbol_status_c128.def_abstract_eval
+@tsolve_with_symbol_status_f64.def_abstract_eval
+@tsolve_with_symbol_status_c128.def_abstract_eval
+def solve_with_symbol_status_abstract_eval(Ai, Aj, Ax, b, symbolic):
+    # Solution (shape of b), plus a scalar RebuildReason for the symbolic handle
+    return (
+        ShapedArray(b.shape, b.dtype),
+        ShapedArray((), jnp.int32),
+    )
+
+
 @rcond_f64.def_abstract_eval
 @rcond_c128.def_abstract_eval
 def rcond_abstract_eval(Ai, Aj, Ax, symbolic, numeric, *, n_col):
@@ -2147,6 +2341,42 @@ def tsolve_with_symbol_c128_vmap(
 
 
 batching.primitive_batchers[tsolve_with_symbol_c128] = tsolve_with_symbol_c128_vmap
+
+
+def solve_with_symbol_status_f64_vmap(vals, axes):
+    return general_vmap_with_symbol_status(solve_with_symbol_status_f64, vals, axes)
+
+
+batching.primitive_batchers[solve_with_symbol_status_f64] = (
+    solve_with_symbol_status_f64_vmap
+)
+
+
+def solve_with_symbol_status_c128_vmap(vals, axes):
+    return general_vmap_with_symbol_status(solve_with_symbol_status_c128, vals, axes)
+
+
+batching.primitive_batchers[solve_with_symbol_status_c128] = (
+    solve_with_symbol_status_c128_vmap
+)
+
+
+def tsolve_with_symbol_status_f64_vmap(vals, axes):
+    return general_vmap_with_symbol_status(tsolve_with_symbol_status_f64, vals, axes)
+
+
+batching.primitive_batchers[tsolve_with_symbol_status_f64] = (
+    tsolve_with_symbol_status_f64_vmap
+)
+
+
+def tsolve_with_symbol_status_c128_vmap(vals, axes):
+    return general_vmap_with_symbol_status(tsolve_with_symbol_status_c128, vals, axes)
+
+
+batching.primitive_batchers[tsolve_with_symbol_status_c128] = (
+    tsolve_with_symbol_status_c128_vmap
+)
 
 
 # Every batcher forwards **params so the n_col attribute (a primitive param on
@@ -2429,6 +2659,77 @@ def general_vmap_with_symbol(
         return prim.bind(
             Ai.astype(jnp.int32), Aj.astype(jnp.int32), Ax, x, symbolic
         ).reshape(*shape), 3
+    msg = "vmap failed. Please select an axis to vectorize over."
+    raise ValueError(msg)
+
+
+def general_vmap_with_symbol_status(
+    prim: jax.extend.core.Primitive,
+    vector_arg_values: tuple[Array, Array, Array, Array, Array],
+    batch_axes: tuple[int | None, int | None, int | None, int | None, int | None],
+) -> tuple[tuple[Array, Array], tuple[int, int | None]]:
+    # As general_vmap_with_symbol, but the primitive also returns a scalar
+    # rebuild reason for the one symbolic handle. That handle is never
+    # vectorized, so its reason is shared across the batch and stays unbatched.
+    Ai, Aj, Ax, x, symbolic = vector_arg_values
+    aAi, aAj, aAx, ax, asymbolic = batch_axes
+
+    if aAi is not None:
+        msg = "Ai cannot be vectorized."
+        raise ValueError(msg)
+    if aAj is not None:
+        msg = "Aj cannot be vectorized."
+        raise ValueError(msg)
+    if asymbolic is not None:
+        msg = "symbolic handle cannot be vectorized."
+        raise ValueError(msg)
+
+    if aAx is not None and ax is not None:
+        if Ax.ndim != 3 or x.ndim != 4:
+            msg = (
+                "Ax and x should be 3D and 4D respectively when vectorizing "
+                f"over them simultaneously. Got: {Ax.shape=}; {x.shape=}."
+            )
+            raise ValueError(msg)
+        Ax = jnp.moveaxis(Ax, aAx, 0)
+        x = jnp.moveaxis(x, ax, 0)
+        shape = x.shape
+        Ax = Ax.reshape(Ax.shape[0] * Ax.shape[1], Ax.shape[2])
+        x = x.reshape(x.shape[0] * x.shape[1], x.shape[2], x.shape[3])
+        sol, rebuild = prim.bind(
+            Ai.astype(jnp.int32), Aj.astype(jnp.int32), Ax, x, symbolic
+        )
+        return (sol.reshape(*shape), rebuild), (0, None)
+    if aAx is not None:
+        if Ax.ndim != 3 or x.ndim != 3:
+            msg = (
+                "Ax and x should both be 3D when vectorizing over Ax. "
+                f"Got: {Ax.shape=}; {x.shape=}."
+            )
+            raise ValueError(msg)
+        Ax = jnp.moveaxis(Ax, aAx, 0)
+        x = jnp.broadcast_to(x[None], (Ax.shape[0], x.shape[0], x.shape[1], x.shape[2]))
+        shape = x.shape
+        Ax = Ax.reshape(Ax.shape[0] * Ax.shape[1], Ax.shape[2])
+        x = x.reshape(x.shape[0] * x.shape[1], x.shape[2], x.shape[3])
+        sol, rebuild = prim.bind(
+            Ai.astype(jnp.int32), Aj.astype(jnp.int32), Ax, x, symbolic
+        )
+        return (sol.reshape(*shape), rebuild), (0, None)
+    if ax is not None:
+        if Ax.ndim != 2 or x.ndim != 4:
+            msg = (
+                "Ax and x should both be 2D and 4D respectively when vectorizing "
+                f"over x. Got: {Ax.shape=}; {x.shape=}."
+            )
+            raise ValueError(msg)
+        x = jnp.moveaxis(x, ax, 3)
+        shape = x.shape
+        x = x.reshape(x.shape[0], x.shape[1], x.shape[2] * x.shape[3])
+        sol, rebuild = prim.bind(
+            Ai.astype(jnp.int32), Aj.astype(jnp.int32), Ax, x, symbolic
+        )
+        return (sol.reshape(*shape), rebuild), (3, None)
     msg = "vmap failed. Please select an axis to vectorize over."
     raise ValueError(msg)
 

@@ -180,6 +180,16 @@ same per-handle `rebuild` is returned by `tsolve_with_numeric_with_status`,
 `rebuild_stats()` gives the per-reason totals: a rising `SUPERSEDED` points at
 stale-alias use, a rising `EVICTED` at cache pressure.
 
+The symbolic solves report the same way. `solve_with_symbol_with_status` and
+`tsolve_with_symbol_with_status` return a single scalar `RebuildReason` for the
+symbolic analysis handle. Unlike the numeric handles, we don't allow batching
+over symbolic handles, so its rebuild reason is always a scalar:
+
+```python
+x, rebuild = klujax.solve_with_symbol_with_status(Ai, Aj, Ax, b, symbolic)
+# rebuild is a scalar RebuildReason for the symbolic analysis.
+```
+
 ## Token Details
 
 A token is a JAX pytree, so it flows through `jit`, `vmap`, and `grad`.
