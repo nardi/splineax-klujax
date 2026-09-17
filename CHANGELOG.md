@@ -7,6 +7,7 @@
 - Drop `has_side_effect` from (re)factor operations. Factoring is now content-addressed and a pure function of its inputs, so XLA can safely eliminate or combine calls.
 - Fix a dtype-dispatch bug where `solve_with_numeric` and `tsolve_with_numeric` chose the KLU entry point from `b` alone. They now use the factorization's dtype, so a complex factorization solved with a real right-hand side no longer down-casts.
 - Add `RebuildReason` and per-call rebuild visibility: `solve_with_numeric_with_status` and `tsolve_with_numeric_with_status` return a per-handle `RebuildReason` you can branch on under `jax.jit`, and `rebuild_stats()` returns the per-reason totals.
+- Add `solve_with_symbol_with_status` and `tsolve_with_symbol_with_status`, which return a scalar `RebuildReason` for the symbolic analysis handle so every token use reports whether it was a cache hit or a rebuild.
 - **Breaking:** `refactor_with_status` now returns `(numeric, status, rebuild)` and `refactor_and_solve_with_status` returns `(x, numeric, status, rebuild)`.
 
 ## 0.5.0.post6
