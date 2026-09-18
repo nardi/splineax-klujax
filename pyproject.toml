@@ -11,16 +11,19 @@ dev = [
   "ruff>=0.9.7",
   "setuptools>=75.8.0",
   "tbump>=6.11.0",
-  "ty==0.0.31"
+  "ty==0.0.31",
 ]
 docs = [
   "mkdocs",
   "mkdocs-shadcn @ git+https://github.com/flaport/mkdocs-shadcn.git",
-  "pymdown-extensions>=10.0"
+  "pymdown-extensions>=10.0",
 ]
 
 [project]
-authors = [{ name = "Floris Laporte", email = "floris.laporte@gmail.com" }, { name = "Nardi Lam", email = "mail@nardilam.nl" }]
+authors = [
+  { name = "Floris Laporte", email = "floris.laporte@gmail.com" },
+  { name = "Nardi Lam", email = "mail@nardilam.nl" },
+]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Programming Language :: Python :: 3",
@@ -29,7 +32,7 @@ classifiers = [
   "Programming Language :: Python :: 3.13",
   "Programming Language :: Python :: 3.14",
   "Operating System :: OS Independent",
-  "Topic :: Scientific/Engineering :: Mathematics"
+  "Topic :: Scientific/Engineering :: Mathematics",
 ]
 dependencies = ["jax>=0.5.0", "jaxlib>=0.5.0", "jaxtyping>=0.2.38", "numpy>=2"]
 description = "a KLU solver for JAX"
@@ -38,7 +41,7 @@ license-files = ["LICENSE"]
 name = "splineax-klujax"
 readme = "README.md"
 requires-python = ">=3.11"
-version = "0.5.0.post6"
+version = "0.5.0.post7"
 
 [[tool.bver.file]]
 src = "README.md"
@@ -66,25 +69,25 @@ target-version = "py311"
 [tool.ruff.format]
 docstring-code-format = true
 
-[tool.ruff.lint]  # see https://docs.astral.sh/ruff/rules
+[tool.ruff.lint] # see https://docs.astral.sh/ruff/rules
 ignore = [
-  "N803",  # invalid-argument-name
-  "D213",  # multi-line-summary-second-line
-  "N806",  # non-lowercase-variable-in-function
-  "TD002",  # missing-todo-author
-  "D211",  # blank-line-before-class
-  "TD003",  # missing-todo-link
-  "PLR0913",  # too-many-arguments
-  "FIX",  # flake8-fixme
-  "ERA",  # eradicate
-  "PLR2004",  # magic-value-comparison
+  "N803",    # invalid-argument-name
+  "D213",    # multi-line-summary-second-line
+  "N806",    # non-lowercase-variable-in-function
+  "TD002",   # missing-todo-author
+  "D211",    # blank-line-before-class
+  "TD003",   # missing-todo-link
+  "PLR0913", # too-many-arguments
+  "FIX",     # flake8-fixme
+  "ERA",     # eradicate
+  "PLR2004", # magic-value-comparison
   "COM812",  # missing-trailing-comma
-  "D203",  # one-blank-line-before-class
+  "D203",    # one-blank-line-before-class
   "ANN001",  # missing-type-annotation
   "ANN202",  # missing-return-type-annotation
   "ARG001",  # unused-function-argument
   "ARG005",  # unused-lambda-argument
-  "S101"  # assert-used
+  "S101",    # assert-used
 ]
 select = ["ALL"]
 

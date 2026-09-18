@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.0.post7
 
 - Handles are now content-addressed. A handle hashes the matrix it names (dtype, sparsity pattern, values) instead of naming a mutable cache slot, so a stale alias can never be handed the wrong matrix. At worst it rebuilds, and identical matrices dedup to one factorization.
 - `refactor` and `refactor_and_solve` re-key to the new values instead of overwriting the old handle in place. They still reuse pivots via `klu_refactor` when safe, and the returned handle is a new content key.
