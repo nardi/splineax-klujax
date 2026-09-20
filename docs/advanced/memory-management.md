@@ -174,8 +174,18 @@ x, rebuild = klujax.solve_with_numeric_with_status(numeric, b, symbolic)
 ```
 
 `rebuild` is an ordinary array, so you can branch on it under `jax.jit` (for
-example, re-pin a factorization when you see `SUPERSEDED` or `EVICTED` churn). The
-same per-handle `rebuild` is returned by `tsolve_with_numeric_with_status`,
+example, re-pin a factorization when you see `SUPERSEDED` or `EVICTED` churn).
+Both status solves also differentiate: they register JVP and transpose rules,
+and the rebuild reason is a constant of the differentiation, so it carries no
+gradient. A differentiated call therefore works without giving up the rebuild
+visibility:
+
+```python
+x, rebuild = klujax.solve_with_numeric_with_status(numeric, b, symbolic)
+grad_b = jax.grad(lambda b: jnp.sum(klujax.solve_with_numeric_with_status(numeric, b, symbolic)[0] ** 2))(b)
+```
+
+The same per-handle `rebuild` is returned by `tsolve_with_numeric_with_status`,
 `refactor_with_status`, and `refactor_and_solve_with_status`.
 `rebuild_stats()` gives the per-reason totals: a rising `SUPERSEDED` points at
 stale-alias use, a rising `EVICTED` at cache pressure.

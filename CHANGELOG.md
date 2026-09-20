@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Register JVP and transpose rules for the status solve primitives, so `solve_with_numeric_with_status` and `tsolve_with_numeric_with_status` differentiate under `jax.grad`, `jax.jvp`, and friends. The rebuild reason is a constant of the differentiation, so it carries no gradient. The JVP delegates the tangent to the plain primitive, and the transpose drops the rebuild cotangent.
+- Add the missing JVP and transpose rules for the plain `tsolve_with_numeric` primitives, which the status transpose rule and the tangent delegation build on.
+
 ## 0.5.0.post7
 
 - Handles are now content-addressed. A handle hashes the matrix it names (dtype, sparsity pattern, values) instead of naming a mutable cache slot, so a stale alias can never be handed the wrong matrix. At worst it rebuilds, and identical matrices dedup to one factorization.

@@ -3438,3 +3438,300 @@ def solve_with_numeric_c128_transpose(ct, Ai, Aj, Ax, symbolic, numeric, b):
 
 
 ad.primitive_transposes[solve_with_numeric_c128] = solve_with_numeric_c128_transpose
+
+
+# Differentiation rules for tsolve_with_numeric ================================
+
+
+def tsolve_with_numeric_value_and_jvp(
+    prim_tsolve: jax.extend.core.Primitive,
+    arg_values: tuple[Array, Array, Array, Array, Array, Array],
+    arg_tangents: tuple[Any, Any, Any, Any, Any, Any],
+) -> tuple[Array, Array]:
+    """Jacobian-vector product rule for `tsolve_with_numeric`.
+
+    As with `solve_with_numeric`, only `b` carries a gradient. The transpose
+    solve is still linear in `b`, so dx = (A^T)^-1 @ db.
+    """
+    Ai, Aj, Ax, symbolic, numeric, b = arg_values
+    t_b = arg_tangents[-1]
+
+    x = prim_tsolve.bind(Ai, Aj, Ax, symbolic, numeric, b)
+
+    if isinstance(t_b, ad.Zero):
+        dx = jnp.zeros_like(x)
+    else:
+        dx = prim_tsolve.bind(Ai, Aj, Ax, symbolic, numeric, t_b)
+
+    return x, dx
+
+
+def tsolve_with_numeric_f64_value_and_jvp(
+    arg_values: tuple[Array, Array, Array, Array, Array, Array],
+    arg_tangents: tuple[Any, Any, Any, Any, Any, Any],
+) -> tuple[Array, Array]:
+    return tsolve_with_numeric_value_and_jvp(
+        tsolve_with_numeric_f64, arg_values, arg_tangents
+    )
+
+
+ad.primitive_jvps[tsolve_with_numeric_f64] = tsolve_with_numeric_f64_value_and_jvp
+
+
+def tsolve_with_numeric_c128_value_and_jvp(
+    arg_values: tuple[Array, Array, Array, Array, Array, Array],
+    arg_tangents: tuple[Any, Any, Any, Any, Any, Any],
+) -> tuple[Array, Array]:
+    return tsolve_with_numeric_value_and_jvp(
+        tsolve_with_numeric_c128, arg_values, arg_tangents
+    )
+
+
+ad.primitive_jvps[tsolve_with_numeric_c128] = tsolve_with_numeric_c128_value_and_jvp
+
+
+def tsolve_with_numeric_transpose(
+    tsolve_prim: jax.extend.core.Primitive,
+    ct: Array,
+    Ai: Array,
+    Aj: Array,
+    Ax: Array,
+    symbolic: Array,
+    numeric: Array,
+    b: Array,
+) -> tuple[None, None, None, None, None, Array]:
+    """Compute the transpose of tsolve_with_numeric.
+
+    The transpose of (A^T)^-1 is A^-1, so the cotangent solves A x_bar = ct
+    with the existing factorization. Only b is linear, so only its cotangent
+    is returned.
+    """
+    solve_prim = (
+        solve_with_numeric_f64
+        if tsolve_prim is tsolve_with_numeric_f64
+        else solve_with_numeric_c128
+    )
+
+    if ad.is_undefined_primal(b):
+        b_bar = solve_prim.bind(Ai, Aj, Ax, symbolic, numeric, ct)
+        # Only b takes a gradient. The matrix and handle inputs do not.
+        return None, None, None, None, None, b_bar
+
+    msg = "No undefined primals in transpose."
+    raise ValueError(msg)
+
+
+def tsolve_with_numeric_f64_transpose(ct, Ai, Aj, Ax, symbolic, numeric, b):
+    return tsolve_with_numeric_transpose(
+        tsolve_with_numeric_f64, ct, Ai, Aj, Ax, symbolic, numeric, b
+    )
+
+
+ad.primitive_transposes[tsolve_with_numeric_f64] = tsolve_with_numeric_f64_transpose
+
+
+def tsolve_with_numeric_c128_transpose(ct, Ai, Aj, Ax, symbolic, numeric, b):
+    return tsolve_with_numeric_transpose(
+        tsolve_with_numeric_c128, ct, Ai, Aj, Ax, symbolic, numeric, b
+    )
+
+
+ad.primitive_transposes[tsolve_with_numeric_c128] = tsolve_with_numeric_c128_transpose
+
+
+# Differentiation rules for solve_with_numeric_with_status =====================
+
+
+def solve_with_numeric_status_value_and_jvp(
+    prim_status: jax.extend.core.Primitive,
+    prim_plain: jax.extend.core.Primitive,
+    arg_values: tuple[Array, Array, Array, Array, Array, Array],
+    arg_tangents: tuple[Any, Any, Any, Any, Any, Any],
+) -> tuple[tuple[Array, Array], tuple[Array, Any]]:
+    """Jacobian-vector product rule for the status-reporting solve variants.
+
+    The primal binds the status primitive, so the reported rebuild reason stays
+    honest. The tangent reuses the plain primitive, which already has the right
+    JVP behavior: the solve is linear in `b`, so dx = A^-1 @ db. The rebuild
+    reason is a constant of the differentiation, so its tangent is a zero.
+    """
+    Ai, Aj, Ax, symbolic, numeric, b = arg_values
+    t_b = arg_tangents[-1]
+
+    x, rebuild = prim_status.bind(Ai, Aj, Ax, symbolic, numeric, b)
+
+    if isinstance(t_b, ad.Zero):
+        dx = jnp.zeros_like(x)
+    else:
+        dx = prim_plain.bind(Ai, Aj, Ax, symbolic, numeric, t_b)
+
+    # An int32 output has no meaningful tangent, so JAX types its tangent space
+    # as float0. A symbolic zero with that aval makes the output non-differentiable.
+    t_rebuild = ad.Zero(jax._src.core.typeof(rebuild).to_tangent_aval())  # noqa: SLF001
+
+    return (x, rebuild), (dx, t_rebuild)
+
+
+def solve_with_numeric_status_f64_value_and_jvp(
+    arg_values: tuple[Array, Array, Array, Array, Array, Array],
+    arg_tangents: tuple[Any, Any, Any, Any, Any, Any],
+) -> tuple[tuple[Array, Array], tuple[Array, Any]]:
+    return solve_with_numeric_status_value_and_jvp(
+        solve_with_numeric_status_f64, solve_with_numeric_f64, arg_values, arg_tangents
+    )
+
+
+ad.primitive_jvps[solve_with_numeric_status_f64] = (
+    solve_with_numeric_status_f64_value_and_jvp
+)
+
+
+def solve_with_numeric_status_c128_value_and_jvp(
+    arg_values: tuple[Array, Array, Array, Array, Array, Array],
+    arg_tangents: tuple[Any, Any, Any, Any, Any, Any],
+) -> tuple[tuple[Array, Array], tuple[Array, Any]]:
+    return solve_with_numeric_status_value_and_jvp(
+        solve_with_numeric_status_c128,
+        solve_with_numeric_c128,
+        arg_values,
+        arg_tangents,
+    )
+
+
+ad.primitive_jvps[solve_with_numeric_status_c128] = (
+    solve_with_numeric_status_c128_value_and_jvp
+)
+
+
+def tsolve_with_numeric_status_f64_value_and_jvp(
+    arg_values: tuple[Array, Array, Array, Array, Array, Array],
+    arg_tangents: tuple[Any, Any, Any, Any, Any, Any],
+) -> tuple[tuple[Array, Array], tuple[Array, Any]]:
+    return solve_with_numeric_status_value_and_jvp(
+        tsolve_with_numeric_status_f64,
+        tsolve_with_numeric_f64,
+        arg_values,
+        arg_tangents,
+    )
+
+
+ad.primitive_jvps[tsolve_with_numeric_status_f64] = (
+    tsolve_with_numeric_status_f64_value_and_jvp
+)
+
+
+def tsolve_with_numeric_status_c128_value_and_jvp(
+    arg_values: tuple[Array, Array, Array, Array, Array, Array],
+    arg_tangents: tuple[Any, Any, Any, Any, Any, Any],
+) -> tuple[tuple[Array, Array], tuple[Array, Any]]:
+    return solve_with_numeric_status_value_and_jvp(
+        tsolve_with_numeric_status_c128,
+        tsolve_with_numeric_c128,
+        arg_values,
+        arg_tangents,
+    )
+
+
+ad.primitive_jvps[tsolve_with_numeric_status_c128] = (
+    tsolve_with_numeric_status_c128_value_and_jvp
+)
+
+
+def solve_with_numeric_status_transpose(
+    prim_tsolve_plain: jax.extend.core.Primitive,
+    ct: tuple[Array, Array],
+    Ai: Array,
+    Aj: Array,
+    Ax: Array,
+    symbolic: Array,
+    numeric: Array,
+    b: Array,
+) -> tuple[None, None, None, None, None, Array]:
+    """Transpose rule for the status-reporting solve variants.
+
+    The rebuild reason is an int32 output, so its cotangent carries no gradient
+    and is dropped. The solution's cotangent flows through the plain transpose
+    logic: solve A^T @ b_bar = ct with the existing factorization.
+    """
+    ct_x, _ct_rebuild = ct
+
+    # Only b takes a gradient, so the cotangent can arrive as a symbolic zero
+    # when the solution is unused. A zero cotangent gives a zero b_bar.
+    if isinstance(ct_x, ad.Zero):
+        b_bar = jnp.zeros_like(b)
+        return None, None, None, None, None, b_bar
+
+    b_bar = prim_tsolve_plain.bind(Ai, Aj, Ax, symbolic, numeric, ct_x)
+    return None, None, None, None, None, b_bar
+
+
+def solve_with_numeric_status_f64_transpose(ct, Ai, Aj, Ax, symbolic, numeric, b):
+    return solve_with_numeric_status_transpose(
+        tsolve_with_numeric_f64,
+        ct,
+        Ai,
+        Aj,
+        Ax,
+        symbolic,
+        numeric,
+        b,
+    )
+
+
+ad.primitive_transposes[solve_with_numeric_status_f64] = (
+    solve_with_numeric_status_f64_transpose
+)
+
+
+def solve_with_numeric_status_c128_transpose(ct, Ai, Aj, Ax, symbolic, numeric, b):
+    return solve_with_numeric_status_transpose(
+        tsolve_with_numeric_c128,
+        ct,
+        Ai,
+        Aj,
+        Ax,
+        symbolic,
+        numeric,
+        b,
+    )
+
+
+ad.primitive_transposes[solve_with_numeric_status_c128] = (
+    solve_with_numeric_status_c128_transpose
+)
+
+
+def tsolve_with_numeric_status_f64_transpose(ct, Ai, Aj, Ax, symbolic, numeric, b):
+    return solve_with_numeric_status_transpose(
+        solve_with_numeric_f64,
+        ct,
+        Ai,
+        Aj,
+        Ax,
+        symbolic,
+        numeric,
+        b,
+    )
+
+
+ad.primitive_transposes[tsolve_with_numeric_status_f64] = (
+    tsolve_with_numeric_status_f64_transpose
+)
+
+
+def tsolve_with_numeric_status_c128_transpose(ct, Ai, Aj, Ax, symbolic, numeric, b):
+    return solve_with_numeric_status_transpose(
+        solve_with_numeric_c128,
+        ct,
+        Ai,
+        Aj,
+        Ax,
+        symbolic,
+        numeric,
+        b,
+    )
+
+
+ad.primitive_transposes[tsolve_with_numeric_status_c128] = (
+    tsolve_with_numeric_status_c128_transpose
+)

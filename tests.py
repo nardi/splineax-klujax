@@ -1649,3 +1649,158 @@ def test_rebuild_stats_breakdown():
     klujax.solve_with_numeric(num, b, sym)
     stats = klujax.rebuild_stats()
     assert stats[klujax.RebuildReason.FREED] >= 1
+
+
+@log_test_name
+@parametrize_dtypes
+def test_solve_with_numeric_with_status_grad(dtype):
+    """grad through solve_with_numeric_with_status matches the dense reference.
+
+    The status variant is the same linear solve as the plain one, so its reverse
+    pass must match: the cotangent of the solution solves the transposed system,
+    and the rebuild reason carries no gradient.
+    """
+    Ai, Aj, Ax, b = _get_rand_arrs_1d(15, (n_col := 5), dtype=dtype)
+    sym = klujax.analyze(Ai, Aj, n_col)
+    num = klujax.factor(Ai, Aj, Ax, sym)
+    A = _dense(Ai, Aj, Ax, n_col, dtype)
+    holomorphic = dtype in COMPLEX_DTYPES
+
+    def f(b):
+        x, _rebuild = klujax.solve_with_numeric_with_status(num, b, sym)
+        return jnp.sum(x**2)
+
+    # d/db sum(x^2) = 2 A^-T x with x = A^-1 b.
+    expected = 2 * jsp.linalg.solve(A.T, jsp.linalg.solve(A, b))
+    _log_and_test_equality(expected, jax.grad(f, holomorphic=holomorphic)(b))
+    _log_and_test_equality(expected, jax.jit(jax.grad(f, holomorphic=holomorphic))(b))
+    _log_and_test_equality(expected, jax.jacrev(f, holomorphic=holomorphic)(b))
+
+
+@log_test_name
+@parametrize_dtypes
+def test_tsolve_with_numeric_with_status_grad(dtype):
+    """grad through tsolve_with_numeric_with_status matches the dense reference.
+
+    The transpose solve is linear in `b`, so its cotangent solves the plain
+    system. The rebuild reason carries no gradient.
+    """
+    Ai, Aj, Ax, b = _get_rand_arrs_1d(15, (n_col := 5), dtype=dtype)
+    sym = klujax.analyze(Ai, Aj, n_col)
+    num = klujax.factor(Ai, Aj, Ax, sym)
+    A = _dense(Ai, Aj, Ax, n_col, dtype)
+    holomorphic = dtype in COMPLEX_DTYPES
+
+    def f(b):
+        x, _rebuild = klujax.tsolve_with_numeric_with_status(num, b, sym)
+        return jnp.sum(x**2)
+
+    # d/db sum(x^2) = 2 A^-1 x with x = A^-T b.
+    expected = 2 * jsp.linalg.solve(A, jsp.linalg.solve(A.T, b))
+    _log_and_test_equality(expected, jax.grad(f, holomorphic=holomorphic)(b))
+    _log_and_test_equality(expected, jax.jit(jax.grad(f, holomorphic=holomorphic))(b))
+
+
+@log_test_name
+@parametrize_dtypes
+def test_solve_with_numeric_with_status_jvp(dtype):
+    """jvp through solve_with_numeric_with_status matches the dense reference.
+
+    The forward pass binds the status primitive, so the rebuild reason stays
+    honest. The tangent solves the same system against db, and the rebuild
+    output gets a zero tangent.
+    """
+    Ai, Aj, Ax, b = _get_rand_arrs_1d(15, (n_col := 5), dtype=dtype)
+    sym = klujax.analyze(Ai, Aj, n_col)
+    num = klujax.factor(Ai, Aj, Ax, sym)
+    A = _dense(Ai, Aj, Ax, n_col, dtype)
+    t_b = jax.random.normal(jax.random.PRNGKey(77), b.shape, dtype=dtype)
+
+    def f(b):
+        return klujax.solve_with_numeric_with_status(num, b, sym)
+
+    (x, rebuild), (dx, _t_rebuild) = jax.jvp(f, (b,), (t_b,))
+    assert int(rebuild[0]) == int(klujax.RebuildReason.NONE)
+    _log_and_test_equality(jsp.linalg.solve(A, b), x)
+    _log_and_test_equality(jsp.linalg.solve(A, t_b), dx)
+
+    def g(b):
+        x, _rebuild = klujax.solve_with_numeric_with_status(num, b, sym)
+        return jnp.sum(x**2)
+
+    _primal, tangent = jax.jvp(g, (b,), (t_b,))
+    expected = 2 * jnp.sum(jsp.linalg.solve(A, b) * jsp.linalg.solve(A, t_b))
+    _log_and_test_equality(expected, tangent)
+
+
+@log_test_name
+@parametrize_dtypes
+def test_solve_with_numeric_with_status_grad_ignores_rebuild(dtype):
+    """The rebuild output accepts cotangents without changing the gradient.
+
+    A caller may sum or branch on the rebuild reason inside a differentiated
+    function. The reason is a constant of the differentiation, so it must not
+    perturb the solution's gradient.
+    """
+    Ai, Aj, Ax, b = _get_rand_arrs_1d(15, (n_col := 5), dtype=dtype)
+    sym = klujax.analyze(Ai, Aj, n_col)
+    num = klujax.factor(Ai, Aj, Ax, sym)
+    A = _dense(Ai, Aj, Ax, n_col, dtype)
+    holomorphic = dtype in COMPLEX_DTYPES
+
+    def f(b):
+        x, rebuild = klujax.solve_with_numeric_with_status(num, b, sym)
+        was_rebuilt = rebuild[0] != jnp.int32(klujax.RebuildReason.NONE)
+        # Branch on the reason under jit, and add a term that reads it.
+        penalty = jax.lax.cond(was_rebuilt, lambda: 0.0, lambda: 0.0)
+        return jnp.sum(x**2) + penalty
+
+    expected = 2 * jsp.linalg.solve(A.T, jsp.linalg.solve(A, b))
+    _log_and_test_equality(expected, jax.jit(jax.grad(f, holomorphic=holomorphic))(b))
+
+
+@log_test_name
+@parametrize_dtypes
+def test_solve_with_numeric_with_status_grad_zero_cotangent(dtype):
+    """A zero cotangent gives a zero gradient without reaching the solver.
+
+    When the solution is unused in the loss, the transpose rule sees a symbolic
+    zero cotangent and must return zeros instead of binding a solve.
+    """
+    Ai, Aj, Ax, b = _get_rand_arrs_1d(15, (n_col := 5), dtype=dtype)
+    sym = klujax.analyze(Ai, Aj, n_col)
+    num = klujax.factor(Ai, Aj, Ax, sym)
+
+    holomorphic = dtype in COMPLEX_DTYPES
+
+    def f(b):
+        x, _rebuild = klujax.solve_with_numeric_with_status(num, b, sym)
+        return jnp.sum(x**2) * 0.0
+
+    got = jax.grad(f, holomorphic=holomorphic)(b)
+    assert jnp.all(got == 0.0)
+
+
+@log_test_name
+@parametrize_dtypes
+def test_solve_with_numeric_with_status_vmap_grad(dtype):
+    """vmap composes with grad through the status variants.
+
+    The batcher already handles the extra rebuild output, so the composition
+    must work for both the solve and the transpose solve.
+    """
+    Ai, Aj, Ax, b = _get_rand_arrs_1d(15, (n_col := 5), dtype=dtype)
+    sym = klujax.analyze(Ai, Aj, n_col)
+    num = klujax.factor(Ai, Aj, Ax, sym)
+    A = _dense(Ai, Aj, Ax, n_col, dtype)
+    holomorphic = dtype in COMPLEX_DTYPES
+    B = jnp.stack([b, b * 2.0])
+
+    def f(b):
+        x, _rebuild = klujax.solve_with_numeric_with_status(num, b, sym)
+        return jnp.sum(x**2)
+
+    expected = jax.vmap(lambda bi: 2 * jsp.linalg.solve(A.T, jsp.linalg.solve(A, bi)))(
+        B
+    )
+    _log_and_test_equality(expected, jax.vmap(jax.grad(f, holomorphic=holomorphic))(B))
