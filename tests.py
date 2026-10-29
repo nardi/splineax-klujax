@@ -1587,6 +1587,46 @@ def test_refactor_result_is_residency_independent(dtype, monkeypatch):
 
 @log_test_name
 @parametrize_dtypes
+def test_factor_after_rejected_refactor_pivots_afresh(dtype):
+    """A `factor` of the values of a rejected `refactor_with_status` pivots afresh.
+
+    The old pivots make the second matrix nearly singular, so `rcond` rejects the
+    refactorization. The fallback `factor` has the same content key, but must not
+    return the rejected factorization.
+    """
+    Ai = jnp.array([0, 0, 1, 1], dtype=jnp.int32)
+    Aj = jnp.array([0, 1, 0, 1], dtype=jnp.int32)
+    first_values = jnp.array([2.0, 1.0, 1.0, 1.0], dtype=dtype)
+    second_values = jnp.array([1e-60, 1.0, 1.0, 1.0], dtype=dtype)
+    b = jnp.array([1.0, 2.0], dtype=dtype)
+    sym = klujax.analyze(Ai, Aj, 2)
+    num = klujax.factor(Ai, Aj, first_values, sym)
+    refactored, _, _ = klujax.refactor_with_status(Ai, Aj, second_values, num, sym)
+    assert float(klujax.rcond(sym, refactored, dtype=dtype)[0]) < 1e-100
+
+    fresh = klujax.factor(Ai, Aj, second_values, sym)
+    assert float(klujax.rcond(sym, fresh, dtype=dtype)[0]) > 1e-2
+    expected = jsp.linalg.solve(_dense(Ai, Aj, second_values, 2, dtype), b)
+    _log_and_test_equality(expected, klujax.solve_with_numeric(fresh, b, sym))
+
+
+@log_test_name
+@parametrize_dtypes
+def test_refactor_deduplicates_reused_pivot_entry(dtype):
+    """A second `refactor` to the same values still reuses the entry, only `factor` replaces it."""
+    Ai = jnp.array([0, 0, 1, 1], dtype=jnp.int32)
+    Aj = jnp.array([0, 1, 0, 1], dtype=jnp.int32)
+    first_values = jnp.array([2.0, 1.0, 1.0, 1.0], dtype=dtype)
+    second_values = jnp.array([3.0, 1.0, 1.0, 1.0], dtype=dtype)
+    sym = klujax.analyze(Ai, Aj, 2)
+    num = klujax.factor(Ai, Aj, first_values, sym)
+    refactored = klujax.refactor(Ai, Aj, second_values, num, sym)
+    again = klujax.refactor(Ai, Aj, second_values, refactored, sym)
+    assert int(again.id[0]) == int(refactored.id[0])
+
+
+@log_test_name
+@parametrize_dtypes
 def test_identical_factor_deduplicates(dtype):
     """Factoring the same matrix twice reuses one factorization (same content key)."""
     Ai, Aj, Ax, _ = _get_rand_arrs_1d(15, (n_col := 5), dtype=dtype)

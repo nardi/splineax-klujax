@@ -304,6 +304,10 @@ struct CacheEntry {
     bool is_complex = false;                // dtype the numeric was factored with
     uint64_t key = 0;                       // content key this entry is filed under
     uint64_t check = 0;                     // second hash lane
+    // True once an in-place klu_refactor has overwritten the numeric with pivots
+    // chosen for an older matrix. Such an entry is never deduplicated into a
+    // factor(), which has to pivot afresh. See make_or_get_numeric.
+    bool reused_pivots = false;
     ~CacheEntry() {
         if (numeric) {
             klu_common c;
@@ -474,9 +478,12 @@ std::shared_ptr<SymbolicObj> build_symbolic(const int* _Ai, const int* _Aj, int 
 
 // Factor one left-hand side against a symbolic, content-addressed. On a hit for
 // the same content (dtype + pattern + values) the resident entry is reused
-// (dedup, skipping klu_factor). Otherwise a fresh entry is built and inserted
-// under its content key. `out_key` receives the content key, `deduped` whether
-// an existing entry was reused. Returns null only on a factor failure (singular).
+// (dedup, skipping klu_factor), unless its pivots were reused from an older
+// matrix. That entry may be numerically poor and only the caller's rcond check
+// can tell, so it is replaced by a fresh factorization under the same key.
+// Otherwise a fresh entry is built and inserted under its content key. `out_key`
+// receives the content key, `deduped` whether an existing entry was reused.
+// Returns null only on a factor failure (singular).
 template <typename T>
 std::shared_ptr<CacheEntry> make_or_get_numeric(std::shared_ptr<SymbolicObj> sym, const int* _Ai,
                                                 const int* _Aj, int n_nz, const T* _Ax_i,
@@ -495,7 +502,8 @@ std::shared_ptr<CacheEntry> make_or_get_numeric(std::shared_ptr<SymbolicObj> sym
     if (auto e = r.lookup(ck.key)) {
         // Reuse only if the second hash lane also agrees, so a (vanishingly rare)
         // primary-key collision never hands back the wrong factorization.
-        if (e->numeric && e->is_complex == is_complex && e->check == ck.check) {
+        if (e->numeric && e->is_complex == is_complex && e->check == ck.check &&
+            !e->reused_pivots) {
             if (out_key) *out_key = ck.key;
             if (deduped) *deduped = true;
             return e;
@@ -636,6 +644,7 @@ std::shared_ptr<CacheEntry> refactor_to_entry(uint64_t K0, const int* _Ai, const
         *klu_status = (int32_t)Common.status;
         if (ok && Common.status >= KLU_OK) {
             e0->check = ck.check;
+            e0->reused_pivots = true;
             r.rekey(K0, K1, e0);
             return e0;
         }
