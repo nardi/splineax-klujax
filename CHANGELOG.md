@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Fix `factor` returning the handle of a rejected `refactor_with_status`. A factorization that reused the pivots of an older matrix is now flagged, and `factor` replaces it with a fresh factorization under the same content key instead of deduplicating onto it.
+
 ## 0.5.0.post7
 
 - Handles are now content-addressed. A handle hashes the matrix it names (dtype, sparsity pattern, values) instead of naming a mutable cache slot, so a stale alias can never be handed the wrong matrix. At worst it rebuilds, and identical matrices dedup to one factorization.

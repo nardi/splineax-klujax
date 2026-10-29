@@ -756,6 +756,11 @@ def factor(Ai: Array, Aj: Array, Ax: Array, symbolic: SymbolToken) -> NumericTok
         Ax: [n_lhs? x n_nz; float64|complex128]: the values of the sparse matrix A
         symbolic: [SymbolToken]: the symbolic analysis handle
 
+    Always pivots afresh. Identical matrices share a handle, but a factorization that
+    refactor() or refactor_with_status() produced with the pivots of an older matrix is
+    not reused. Calling factor() with the same values replaces it, so a handle that
+    was rejected after refactor_with_status() cannot come back from this function.
+
     Returns:
         numeric: [NumericToken]: the numeric factorization handle
 
