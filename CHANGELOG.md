@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.0.post8
 
 - Fix `factor` returning the handle of a rejected `refactor_with_status`. A factorization that reused the pivots of an older matrix is now flagged, and `factor` replaces it with a fresh factorization under the same content key instead of deduplicating onto it.
 
